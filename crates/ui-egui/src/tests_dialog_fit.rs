@@ -9,6 +9,9 @@ use crate::headless::Headless;
 use crate::{LightcraftApp, Services};
 
 const T: Duration = Duration::from_secs(20);
+/// How long an export the test started may take to finish: real work on background threads, so the bound
+/// is the crate's usual one for that (`SETTLE`), not a guess at how fast this machine is.
+const EXPORT_DONE: Duration = Duration::from_secs(120);
 
 fn demo(size: [f32; 2]) -> Headless {
     let services = Services { png: None, write_shared: Some(std::sync::Arc::new(|_: &str, _: &[u8]| Ok(()))), ..Default::default() };
@@ -70,7 +73,7 @@ fn export_dialog_fits_a_short_window_and_its_button_exports() {
         h.step();
         assert!(h.app.ui.dialog.is_none(), "Export closed the dialog at {size:?}");
         assert!(h.app.export.is_some() || h.app.last_export_result.is_some(), "Export started at {size:?}");
-        assert!(h.step_until(Duration::from_secs(60), |h| h.app.export.is_none()));
+        assert!(h.step_until(EXPORT_DONE, |h| h.app.export.is_none()), "the export finished at {size:?}");
     }
 }
 
