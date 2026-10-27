@@ -35,7 +35,8 @@ usage: cargo xtask <command>
 commands:
   assets          every image/icon/font/media file is attributed in assets/ATTRIBUTION.md; no Adobe assets
   ai-bench fetch|run
-                  reproduce the face-detection accuracy on WIDER FACE validation; see docs/faces.md
+                  reproduce the face-detection accuracy on WIDER FACE validation and the face-recognition
+                  accuracy on LFW; see docs/faces.md
   bench [FILE] [--strict] [--threshold PCT]
                   run the render benchmark, append to target/bench/history.jsonl, compare CPU time with
                   the previous run (default input: corpus/raw/arw-sony-a7m3-compressed.arw)

@@ -124,12 +124,115 @@ pub fn wider_ap(images: &[Image]) -> f64 {
     voc_ap(&recall, &precision)
 }
 
+/// The cut-off (a pair is "same" when its score is at least the cut-off) that gets most of `pairs` (score, same person)
+/// right. Non-finite scores are ignored; among equally good cut-offs the lowest wins.
+fn best_cutoff(pairs: &[(f64, bool)]) -> f64 {
+    let mut sorted: Vec<(f64, bool)> = pairs.iter().copied().filter(|p| p.0.is_finite()).collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // a cut-off below every score calls every pair "same"
+    let mut right = sorted.iter().filter(|p| p.1).count() as i64;
+    let mut best = (right, sorted.first().map_or(0.0, |p| p.0 - 1.0));
+    let mut groups = sorted.chunk_by(|a, b| a.0 == b.0).peekable();
+    while let Some(group) = groups.next() {
+        // raising the cut-off past this score turns its pairs into "different"
+        right += group.iter().map(|p| if p.1 { -1 } else { 1 }).sum::<i64>();
+        let score = group.first().map_or(0.0, |p| p.0);
+        let cutoff = groups.peek().and_then(|next| next.first()).map_or(score + 1.0, |n| (score + n.0) / 2.0);
+        if right > best.0 {
+            best = (right, cutoff);
+        }
+    }
+    best.1
+}
+
+/// LFW's verification accuracy: 10-fold cross-validation over `pairs` (score, same person, fold). For each fold the
+/// cut-off that is best on the other folds is applied to it; the result is the mean and the standard deviation of the
+/// folds' accuracies, as fractions. A pair without a score (`None`: a photo could not be embedded) takes no part in
+/// choosing a cut-off and counts as wrong in its own fold.
+pub fn fold_accuracy(pairs: &[(Option<f64>, bool, usize)]) -> (f64, f64) {
+    let folds: std::collections::BTreeSet<usize> = pairs.iter().map(|p| p.2).collect();
+    let mut accuracies = Vec::new();
+    for fold in folds {
+        let train: Vec<(f64, bool)> = pairs.iter().filter(|p| p.2 != fold).filter_map(|p| Some((p.0?, p.1))).collect();
+        let test: Vec<&(Option<f64>, bool, usize)> = pairs.iter().filter(|p| p.2 == fold).collect();
+        let cutoff = best_cutoff(&train);
+        let right = test.iter().filter(|p| p.0.is_some_and(|score| (score >= cutoff) == p.1)).count();
+        accuracies.push(right as f64 / test.len().max(1) as f64);
+    }
+    if accuracies.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = accuracies.iter().sum::<f64>() / accuracies.len() as f64;
+    let variance = accuracies.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / accuracies.len() as f64;
+    (mean, variance.sqrt())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-9, "{a} != {b}");
+    }
+
+    #[test]
+    fn the_best_cutoff_sits_between_the_scores_it_separates() {
+        // different 0.2, same 0.3, different 0.7, same 0.8: calling everything "same" gets 2 right, a cut-off in
+        // (0.2, 0.3] gets 3, one in (0.7, 0.8] also 3; the lowest of the best is the midpoint 0.25
+        close(best_cutoff(&[(0.8, true), (0.2, false), (0.7, false), (0.3, true)]), 0.25);
+        // perfectly separable
+        close(best_cutoff(&[(0.1, false), (0.2, false), (0.8, true), (0.9, true)]), 0.5);
+        // every pair the same person: a cut-off below all of them
+        close(best_cutoff(&[(0.4, true), (0.6, true)]), -0.6);
+        // every pair a different person: above all of them
+        close(best_cutoff(&[(0.4, false), (0.6, false)]), 1.6);
+        // equal scores cannot be split: the pair stays together and the cut-off stays at the start
+        close(best_cutoff(&[(0.5, true), (0.5, false)]), -0.5);
+        // a non-finite score is ignored, and nothing at all has a neutral cut-off
+        close(best_cutoff(&[(f64::NAN, true), (0.1, false), (0.9, true)]), 0.5);
+        close(best_cutoff(&[]), 0.0);
+    }
+
+    /// Three folds of two pairs. The cut-off for fold 0 is trained on folds 1 and 2 (different 0.2, same 0.3, different
+    /// 0.7, same 0.8: best 0.25), which gets fold 0's 0.9 same and 0.1 different both right: 1. For fold 1 it is trained
+    /// on 0.1 F, 0.3 T, 0.7 F, 0.9 T: best 0.2, which calls 0.8 right and 0.2 "same" wrongly: 1/2. For fold 2 it is
+    /// trained on 0.1 F, 0.2 F, 0.8 T, 0.9 T: best 0.5, which gets both of fold 2's inverted pairs wrong: 0.
+    /// Mean (1 + 1/2 + 0) / 3 = 1/2; variance (1/4 + 0 + 1/4) / 3 = 1/6.
+    #[test]
+    fn fold_accuracy_by_hand() {
+        let pairs =
+            [(Some(0.9), true, 0), (Some(0.1), false, 0), (Some(0.8), true, 1), (Some(0.2), false, 1), (Some(0.3), true, 2), (Some(0.7), false, 2)];
+        let (mean, std) = fold_accuracy(&pairs);
+        close(mean, 0.5);
+        close(std, (1.0f64 / 6.0).sqrt());
+        // separable in every fold: all right, no spread
+        let clean = [(Some(0.9), true, 0), (Some(0.1), false, 0), (Some(0.8), true, 1), (Some(0.2), false, 1)];
+        assert_eq!(fold_accuracy(&clean), (1.0, 0.0));
+        // no pairs: zero, not a division by zero
+        assert_eq!(fold_accuracy(&[]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_pair_without_a_score_is_wrong_and_does_not_move_the_cut_off() {
+        // two separable folds; fold 0 also holds a different-person pair whose photo failed (no score) and fold 1 two same-person ones
+        let pairs = [
+            (Some(0.9), true, 0),
+            (Some(0.1), false, 0),
+            (None, false, 0),
+            (Some(0.8), true, 1),
+            (Some(0.2), false, 1),
+            (None, true, 1),
+            (None, true, 1),
+        ];
+        // fold 0: 2 of 3 right (the failed different pair gets no credit); fold 1: 2 of 4 right
+        let (mean, std) = fold_accuracy(&pairs);
+        close(mean, (2.0 / 3.0 + 0.5) / 2.0);
+        close(std, (2.0f64 / 3.0 - 0.5).abs() / 2.0);
+        // failures are not training data: without them every fold is separable
+        let scored: Vec<_> = pairs.iter().filter(|p| p.0.is_some()).copied().collect();
+        close(fold_accuracy(&scored).0, 1.0);
+        // nothing scored at all: every pair is wrong
+        close(fold_accuracy(&[(None, true, 0), (None, false, 0), (None, true, 1), (None, false, 1)]).0, 0.0);
     }
 
     #[test]

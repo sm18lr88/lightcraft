@@ -113,7 +113,7 @@ fn face_indices(entry: &mat::Value, setting: &str, event: usize, photo: usize, f
 }
 
 /// A photo as 8-bit RGB: `(pixels, width, height)`.
-fn load_rgb(path: &Path) -> Result<(Vec<u8>, usize, usize), String> {
+pub(super) fn load_rgb(path: &Path) -> Result<(Vec<u8>, usize, usize), String> {
     use zune_core::bytestream::ZCursor;
     use zune_core::colorspace::ColorSpace;
     use zune_core::options::DecoderOptions;
