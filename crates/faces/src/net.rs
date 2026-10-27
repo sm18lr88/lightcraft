@@ -189,6 +189,26 @@ impl Net {
         verdict
     }
 
+    /// Check the attached accelerator against the CPU on a further `probe` (another input shape, say), the way
+    /// [`Net::attach_checked`] does on its first. When it disagrees or fails it is dropped and the reason returned.
+    pub fn verify_attached(&self, probe: &Tensor, tolerance: f32) -> std::result::Result<(), String> {
+        let Some(accelerator) = self.accelerator() else { return Err("no accelerator is attached".into()) };
+        self.detach();
+        let verdict = (|| {
+            let cpu = self.run(probe.clone()).map_err(|e| e.to_string())?;
+            *self.accelerator.write().unwrap_or_else(PoisonError::into_inner) = Some(accelerator);
+            let fast = self.run(probe.clone()).map_err(|e| e.to_string())?;
+            if self.accelerator().is_none() {
+                return Err("the device failed on the test input".to_string());
+            }
+            agree(&cpu, &fast, tolerance)
+        })();
+        if verdict.is_err() {
+            self.detach();
+        }
+        verdict
+    }
+
     /// Run on the CPU only from now on.
     pub fn detach(&self) {
         *self.accelerator.write().unwrap_or_else(PoisonError::into_inner) = None;
