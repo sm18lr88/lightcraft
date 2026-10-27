@@ -174,6 +174,15 @@ pub enum Dialog {
         burst_gap: f32,
         similarity: f32,
     },
+    /// Photo ▸ Find Duplicates: the level chosen (`near`: also the same picture saved again), the last
+    /// `library.findDuplicates` answer, and the photos ticked to keep.
+    Duplicates {
+        near: bool,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+        #[serde(default)]
+        keep: Vec<u64>,
+    },
     /// Help ▸ System Info: (label, value) rows.
     DenoiseModel {
         info: serde_json::Value,
