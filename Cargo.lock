@@ -3857,6 +3857,8 @@ version = "0.14.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "flate2",
+ "image",
  "lightcraft-fetch",
  "serde_json",
  "thiserror 2.0.21",

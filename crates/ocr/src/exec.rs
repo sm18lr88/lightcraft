@@ -322,7 +322,12 @@ fn compile(n: &NodeProto, consts: &HashMap<String, Value>, opset: i64) -> Result
             Op::Conv { window: window(n, kernel)?, groups }
         }
         "ConvTranspose" => {
-            let win = window(n, None)?;
+            // the kernel is the weights' last two dims; candle's output-size arithmetic is unchecked, so an empty one is refused here
+            let kernel = match n.inputs.get(1).and_then(|w| consts.get(w)) {
+                Some(Value::F(t)) if t.rank() == 4 => [t.dim(2)?, t.dim(3)?],
+                _ => return Err(unsupported(n, "the weights must be a constant 4-D tensor")),
+            };
+            let win = window(n, Some(kernel))?;
             let [sh, sw] = win.strides;
             if sh != sw || win.dilation != 1 || attr_int(n, "group", 1)? != 1 || !matches!(win.pads, Pads::Fixed([0, 0, 0, 0])) {
                 return Err(unsupported(n, "only an unpadded, ungrouped transposed convolution with equal strides is supported"));
@@ -1075,6 +1080,9 @@ fn exec(budget: &Budget, op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             let (w_in, c_out, kh, kw) = w.dims4()?;
             if w_in != c_in {
                 return Err(msg(format!("{c_in} input channels for weights of {:?}", w.dims())));
+            }
+            if h == 0 || wd == 0 || kh == 0 || kw == 0 {
+                return Err(msg("a transposed convolution over an empty feature map or kernel"));
             }
             // the output grows with the stride and the weights' kernel; candle also builds a [c_out·kh·kw, h·w] product
             let grown = |len: usize, k: usize| {
@@ -1862,6 +1870,32 @@ mod tests {
         let empty = Value::F(Tensor::zeros((0, 1, 1, 1), candle_core::DType::F32, &Device::Cpu).unwrap());
         let sizes = Value::I(vec![0, 1, 1 << 40, 1]);
         assert!(exec(&Budget::new(usize::MAX), &Op::Resize, &[Some(&empty), None, None, Some(&sizes)]).is_err());
+    }
+
+    /// A hostile transposed convolution: weights that are not a constant 4-D tensor or have an empty kernel fail at load; a
+    /// zero-sized or too-large input is an error before candle's unchecked output-size arithmetic.
+    #[test]
+    fn hostile_transposed_convolutions_are_errors() {
+        let up = |w_shape: &[i64], attrs: &[Vec<u8>]| {
+            let n = w_shape.iter().product::<i64>().max(0) as usize;
+            model(&[node("ConvTranspose", &["x", "w"], &["y"], attrs)], &[tensor_f32("w", w_shape, &vec![1.0; n])], &["x"], &["y"])
+        };
+        assert!(graph(&up(&[1, 1, 0, 2], &[])).is_err(), "an empty kernel");
+        assert!(graph(&up(&[1, 2, 2], &[])).is_err(), "weights that are not 4-D");
+        let no_weights = model(&[node("ConvTranspose", &["x", "w"], &["y"], &[])], &[], &["x", "w"], &["y"]);
+        assert!(graph(&no_weights).is_err(), "weights that are not constants");
+        // a feature map with no rows
+        let g = graph(&up(&[1, 1, 2, 2], &[])).unwrap();
+        let empty = Tensor::zeros((1, 1, 0, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(g.run(&empty).is_err());
+        // an output of more than the runtime limit: 599 × 64 + 2 = 38338 rows and columns
+        let g = graph(&up(&[1, 1, 2, 2], &[attr_ints("strides", &[64, 64])])).unwrap();
+        let big = Tensor::zeros((1, 1, 600, 600), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(g.run(&big).is_err());
+        // an ordinary one runs: 2 × 2 weights of 1 over a 2 × 2 map of 1, stride 1
+        let g = graph(&up(&[1, 1, 2, 2], &[])).unwrap();
+        let x = Tensor::ones((1, 1, 2, 2), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(run1(&g, x), vec![1., 2., 1., 2., 4., 2., 1., 2., 1.]);
     }
 
     #[test]

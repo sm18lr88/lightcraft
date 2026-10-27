@@ -3,7 +3,7 @@
 //! about 50 languages (Chinese, Japanese and Latin scripts included) with one alphabet.
 //!
 //! The graphs are PaddlePaddle's own ONNX exports, run by a small executor for the operators they use ([`exec`],
-//! reading ONNX with [`onnx`]); pre- and post-processing follow PaddleOCR 3's pipeline ([`db`], [`ctc`], [`image`]).
+//! reading ONNX with [`onnx`]); pre- and post-processing follow PaddleOCR 3's pipeline ([`reader`], [`db`], [`ctc`], [`image`]).
 //! The model sets and their pinned files are in [`known`], with the licence a user accepts before the download.
 //!
 //! The pieces that need no model (images, boxes, decoding, the model list) build everywhere; the models only run
@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod architecture;
 pub mod ctc;
 pub mod db;
 pub mod image;
@@ -20,6 +21,8 @@ pub mod known;
 pub mod exec;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod onnx;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -127,6 +127,8 @@ impl Rgb {
             let w2 = ((A + 2.0) * (1.0 - t) - (A + 3.0)) * (1.0 - t) * (1.0 - t) + 1.0;
             [w0, w1, w2, 1.0 - w0 - w1 - w2]
         }
+        // far outside the photo every sample is an edge pixel; the clamp keeps the `isize` arithmetic below in range
+        let (x, y) = (x.clamp(-1.0e9, 1.0e9), y.clamp(-1.0e9, 1.0e9));
         let (fx, fy) = (x.floor(), y.floor());
         let (wx, wy) = (weights(x - fx), weights(y - fy));
         let (ix, iy) = (fx as isize, fy as isize);
@@ -172,6 +174,16 @@ mod tests {
     fn gray(w: usize, h: usize, f: impl Fn(usize, usize) -> u8) -> Rgb {
         let data = (0..h).flat_map(|y| (0..w).flat_map(|x| [f(x, y); 3]).collect::<Vec<_>>()).collect::<Vec<_>>();
         Rgb::new(w, h, data).unwrap()
+    }
+
+    #[test]
+    fn a_sample_far_outside_the_photo_is_the_edge_pixel_not_an_overflow() {
+        let img = gray(4, 3, |x, y| (10 * x + y) as u8);
+        // beyond the right edge and above the top: the replicated corner pixel (3, 0); the integer arithmetic must not wrap
+        assert_eq!(img.bicubic(1e30, -1e30), [30; 3]);
+        assert_eq!(img.bicubic(-1e30, 1e30), [2; 3]);
+        // inside the photo nothing changes: a whole-pixel sample is that pixel
+        assert_eq!(img.bicubic(2.0, 1.0), [21; 3]);
     }
 
     #[test]

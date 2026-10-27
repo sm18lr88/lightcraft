@@ -17,3 +17,13 @@ thiserror = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 lightcraft-fetch = { workspace = true }
+
+[[example]]
+name = "hiertext"
+# its unit tests (word cutting, matching, the seeded subset) run with the crate's
+test = true
+
+[dev-dependencies]
+# the HierText benchmark example (examples/hiertext.rs) decodes the photos and the annotations' gzip
+image = { workspace = true }
+flate2 = "1"
