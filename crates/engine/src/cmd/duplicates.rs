@@ -159,8 +159,9 @@ fn scope(s: &Session, p: &Value, c: &str) -> Result<Vec<PhotoId>> {
 }
 
 /// A duplicate scan in steps. [`Scan::begin`] reads the parameters and groups the byte-identical photos (catalog only),
-/// [`Scan::step`] reads look-alike signatures within a time budget (the slow part: every cache miss decodes a thumbnail)
-/// and [`Scan::finish`] builds the answer of `library.findDuplicates`. The command runs every step at once; the Find
+/// [`Scan::step`] reads look-alike signatures, then joins the look-alikes, both within a time budget (reading is the
+/// slow part: every cache miss decodes a thumbnail; the join compares signatures and grows with the library) and
+/// [`Scan::finish`] only assembles the answer of `library.findDuplicates`. The command runs every step at once; the Find
 /// Duplicates dialog runs a few milliseconds of them per frame, so its window keeps answering, shows the progress and
 /// can stop the scan.
 pub struct Scan {
@@ -171,6 +172,12 @@ pub struct Scan {
     /// The next unit whose signature is read (near level).
     next: usize,
     unreadable: Vec<u64>,
+    /// Which units are one picture (near level; filled by the join phase of [`Scan::step`]).
+    sets: Sets,
+    /// The units with a signature, in sweep order (built when the join starts).
+    order: Option<Vec<(f32, usize)>>,
+    /// How many entries of `order` have been compared with the ones after them.
+    joined: usize,
 }
 
 impl Scan {
@@ -207,7 +214,8 @@ impl Scan {
             units.push(Unit { members: ranked(s, members), signature: None, aspect: 0.0 });
         }
         units.sort_by_key(|u| u.members.iter().map(|m| m.0).min());
-        Ok(Scan { near, min, scanned: ids.len(), units, next: 0, unreadable: Vec::new() })
+        let sets = Sets::new(units.len());
+        Ok(Scan { near, min, scanned: ids.len(), units, next: 0, unreadable: Vec::new(), sets, order: None, joined: 0 })
     }
 
     /// `(units looked at, units)`: how far the signatures are read (the exact level reads none).
@@ -215,28 +223,19 @@ impl Scan {
         (if self.near { self.next } else { self.units.len() }, self.units.len())
     }
 
-    /// Read signatures for about `budget` (at least one unit per call; all that are left without a budget). Near level:
-    /// one signature per unit, read from its best copy. `true` when every unit has been looked at.
+    /// Work for about `budget` (at least one unit per call; all that is left without a budget). Near level: first one
+    /// signature per unit, read from its best copy, then the join of the look-alikes, one unit at a time. `true` when
+    /// nothing is left to do.
     pub fn step(&mut self, s: &mut Session, budget: Option<std::time::Duration>) -> bool {
         if !self.near {
             return true;
         }
         let deadline = budget.and_then(|b| std::time::Instant::now().checked_add(b));
         loop {
-            let i = self.next;
-            let Some(u) = self.units.get_mut(i) else { return true };
-            if let Some(&best) = u.members.first() {
-                let (w, h) = s.catalog.photo(best).map_or((0, 0), |q| (q.width, q.height));
-                u.aspect = if w > 0 && h > 0 { f64::from(w) / f64::from(h) } else { 0.0 };
-                if u.aspect > 0.0 {
-                    u.signature = super::cull::signature_of(s, best).filter(|sig| sig.iter().any(|v| *v != 0.0));
-                    if u.signature.is_none() {
-                        self.unreadable.extend(u.members.iter().map(|m| m.0));
-                    }
-                }
-            }
-            self.next += 1;
-            if self.next >= self.units.len() {
+            if self.next < self.units.len() {
+                self.read_signature(s);
+                self.next += 1;
+            } else if self.join_step() {
                 return true;
             }
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -245,14 +244,58 @@ impl Scan {
         }
     }
 
+    /// Read the signature of unit `self.next`.
+    fn read_signature(&mut self, s: &mut Session) {
+        let Some(u) = self.units.get_mut(self.next) else { return };
+        let Some(&best) = u.members.first() else { return };
+        let (w, h) = s.catalog.photo(best).map_or((0, 0), |q| (q.width, q.height));
+        u.aspect = if w > 0 && h > 0 { f64::from(w) / f64::from(h) } else { 0.0 };
+        if u.aspect > 0.0 {
+            u.signature = super::cull::signature_of(s, best).filter(|sig| sig.iter().any(|v| *v != 0.0));
+            if u.signature.is_none() {
+                self.unreadable.extend(u.members.iter().map(|m| m.0));
+            }
+        }
+    }
+
+    /// Compare the next unit of the sweep with the ones close to it and join the look-alikes. `true` when the sweep is
+    /// through. Units are swept in order of their signature's position along one fixed direction: two signatures that
+    /// are `min` alike are no further apart than `sqrt(2 - 2 min)` there, so a unit is only compared with the ones that
+    /// close.
+    fn join_step(&mut self) -> bool {
+        let units = &self.units;
+        let order = self.order.get_or_insert_with(|| {
+            let weights = sweep_weights();
+            let norm = sweep_norm(&weights);
+            let mut order: Vec<(f32, usize)> =
+                units.iter().enumerate().filter_map(|(i, u)| Some((along(u.signature.as_ref()?, &weights, norm), i))).collect();
+            order.sort_by(|a, b| a.0.total_cmp(&b.0));
+            order
+        });
+        let n = self.joined;
+        let Some(&(pos, i)) = order.get(n) else { return true };
+        self.joined = n.saturating_add(1);
+        let min = self.min as f32;
+        let reach = (2.0 - 2.0 * min).max(0.0).sqrt() + 1e-4;
+        if let Some(a) = units.get(i) {
+            for &(other, j) in order.iter().skip(n.saturating_add(1)) {
+                if other - pos > reach {
+                    break;
+                }
+                let Some(b) = units.get(j) else { continue };
+                let (Some(sa), Some(sb)) = (&a.signature, &b.signature) else { continue };
+                let shape = (a.aspect - b.aspect).abs() <= ASPECT_TOLERANCE * a.aspect.max(b.aspect);
+                if shape && similarity(sa, sb) >= min {
+                    self.sets.join(i, j);
+                }
+            }
+        }
+        self.joined >= order.len()
+    }
+
     /// The answer of `library.findDuplicates`, once [`Scan::step`] has returned `true`.
     pub fn finish(self, s: &Session) -> Value {
-        let Scan { near, min, scanned, units, unreadable, .. } = self;
-        // units of the same shape that look the same are one group
-        let mut sets = Sets::new(units.len());
-        if near {
-            join_look_alikes(&units, min as f32, &mut sets);
-        }
+        let Scan { near, scanned, units, unreadable, mut sets, .. } = self;
 
         // groups: the units that ended in one set
         let mut sets_members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -318,30 +361,18 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(scan.finish(s))
 }
 
-/// Join into one set the units whose signatures reach `min` and whose shapes agree. Units are swept in order of their
-/// signature's position along one fixed direction: two signatures that are `min` alike are no further apart than
-/// `sqrt(2 - 2 min)` there, so a unit is only compared with the ones that close.
-fn join_look_alikes(units: &[Unit], min: f32, sets: &mut Sets) {
-    let weights: [f32; 64] = std::array::from_fn(|i| (i % 8) as f32 - 3.5);
-    let norm = weights.iter().map(|w| w * w).sum::<f32>().sqrt().max(1e-6);
-    let along = |sig: &[f32; 64]| sig.iter().zip(&weights).map(|(v, w)| v * w).sum::<f32>() / norm;
-    let mut order: Vec<(f32, usize)> = units.iter().enumerate().filter_map(|(i, u)| Some((along(u.signature.as_ref()?), i))).collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let reach = (2.0 - 2.0 * min).max(0.0).sqrt() + 1e-4;
-    for (n, &(pos, i)) in order.iter().enumerate() {
-        let Some(a) = units.get(i) else { continue };
-        for &(other, j) in order.iter().skip(n + 1) {
-            if other - pos > reach {
-                break;
-            }
-            let Some(b) = units.get(j) else { continue };
-            let (Some(sa), Some(sb)) = (&a.signature, &b.signature) else { continue };
-            let shape = (a.aspect - b.aspect).abs() <= ASPECT_TOLERANCE * a.aspect.max(b.aspect);
-            if shape && similarity(sa, sb) >= min {
-                sets.join(i, j);
-            }
-        }
-    }
+/// The fixed direction the join sweeps along.
+fn sweep_weights() -> [f32; 64] {
+    std::array::from_fn(|i| (i % 8) as f32 - 3.5)
+}
+
+fn sweep_norm(weights: &[f32; 64]) -> f32 {
+    weights.iter().map(|w| w * w).sum::<f32>().sqrt().max(1e-6)
+}
+
+/// A signature's position along the sweep direction.
+fn along(sig: &[f32; 64], weights: &[f32; 64], norm: f32) -> f32 {
+    sig.iter().zip(weights).map(|(v, w)| v * w).sum::<f32>() / norm
 }
 
 /// Mark every photo of a group Rejected except the ones kept. One undo step; nothing is deleted.

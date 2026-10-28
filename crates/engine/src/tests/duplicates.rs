@@ -213,9 +213,10 @@ fn a_photo_whose_file_cannot_be_read_is_reported_not_fatal() {
 }
 
 /// The scan the dialog runs a few milliseconds per frame gives the command's answer, and with no time to spare a step
-/// reads one picture (so a frame never stalls on more than one thumbnail).
+/// reads one picture (so a frame never stalls on more than one thumbnail) and, once every picture is read, joins one
+/// unit with its look-alikes (the join is budgeted too: `finish` only assembles the answer).
 #[test]
-fn a_scan_in_steps_gives_the_commands_answer_and_reads_one_picture_per_step_without_a_budget() {
+fn a_scan_in_steps_gives_the_commands_answer_and_reads_or_joins_one_unit_per_step_without_a_budget() {
     use crate::cmd::duplicates::Scan;
     let mut s = library("steps");
     let want = s.execute("library.findDuplicates", &json!({})).unwrap();
@@ -223,12 +224,16 @@ fn a_scan_in_steps_gives_the_commands_answer_and_reads_one_picture_per_step_with
     let total = scan.progress().1;
     assert_eq!(total, 4, "four files, none byte-identical");
     assert_eq!(scan.progress().0, 0);
-    let mut calls = 0;
+    let (mut calls, mut join_calls) = (0, 0);
     while !scan.step(&mut s, Some(std::time::Duration::ZERO)) {
         calls += 1;
-        assert_eq!(scan.progress(), (calls, total), "one picture per step");
+        assert_eq!(scan.progress(), (calls.min(total), total), "one picture per step");
+        if calls > total {
+            join_calls += 1;
+        }
     }
-    assert_eq!(calls, total - 1, "the last step reports the end");
+    assert!(calls >= total, "every picture is read before the scan can end: {calls} steps");
+    assert!(join_calls >= 2, "the look-alike join needs several steps, not one unbudgeted pass in `finish`: {join_calls}");
     assert_eq!(scan.finish(&s), want);
     // a bad parameter is refused before anything is read
     assert!(Scan::begin(&s, &json!({"level": "close"})).is_err());

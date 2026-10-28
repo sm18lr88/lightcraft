@@ -20,6 +20,9 @@ use super::{LightcraftApp, Tokens, json, list_height};
 const CELL: f32 = 120.0;
 /// How long a frame reads signatures for.
 const STEP_BUDGET: Duration = Duration::from_millis(12);
+/// The thumbnail bucket requested for a 112 x 84 point cell (up to 2x scale), and its priority (as a print page's cells).
+const THUMB_PX: usize = 256;
+const THUMB_PRIORITY: u32 = 10;
 /// Most groups laid out at once: the rest wait until some of these are decided. (A group is shown whole: the photos it
 /// marks Rejected must all be in sight.)
 const MAX_GROUPS_SHOWN: usize = 100;
@@ -178,6 +181,8 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, near: &mut b
                         ui.vertical(|ui| {
                             ui.set_width(CELL);
                             let size = egui::vec2(112.0, 84.0);
+                            // photos the library grid does not show (scrolled away, filtered out) have no thumbnail yet
+                            crate::panels::grid::request_thumb(app, id, THUMB_PX, THUMB_PRIORITY);
                             match app.renderer.thumb(id) {
                                 Some(tex) => {
                                     let [w, h] = tex.size;
