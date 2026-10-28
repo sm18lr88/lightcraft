@@ -25,6 +25,9 @@ const MAX_PAD: usize = 1024;
 /// Largest kernel side a window may have (PP-OCR's are a few taps): a model file asking for more is refused at load,
 /// before a pad of half that size is allocated.
 const MAX_KERNEL: usize = 1024;
+/// Largest stride a window may have (PP-OCR's are 1 or 2): the depthwise path allocates one phase per stride step, and a
+/// ceil-mode pool and a transposed convolution size their output by it.
+const MAX_STRIDE: usize = 64;
 
 /// The default-domain operator sets whose semantics for these operators [`Graph`] follows.
 pub const OPSETS: std::ops::RangeInclusive<i64> = 7..=17;
@@ -224,7 +227,11 @@ fn window(n: &NodeProto, kernel: Option<[usize; 2]>) -> Result<Window> {
         "VALID" => Pads::Fixed([0; 4]),
         other => return Err(unsupported(n, format!("auto_pad {other}"))),
     };
-    Ok(Window { kernel, strides: pair(n, "strides", 1)?, dilation: dh, pads })
+    let strides = pair(n, "strides", 1)?;
+    if strides.iter().any(|s| *s > MAX_STRIDE) {
+        return Err(unsupported(n, format!("strides {strides:?} (at most {MAX_STRIDE})")));
+    }
+    Ok(Window { kernel, strides, dilation: dh, pads })
 }
 
 /// The extent of a kernel of `k` taps `dilation` apart: `(k - 1) · dilation + 1`, checked.
@@ -626,12 +633,14 @@ fn pool(x: &Tensor, win: &Window, ceil: bool, max: bool) -> Result<Tensor> {
     }
     let (oh, ow) = (out_len(h, kh, sh, ceil)?, out_len(w, kw, sw, ceil)?);
     // ceil mode: the last window may run past the edge; extend with edge values (max) — averages are refused there
-    let need_h = (oh - 1) * sh + kh;
-    let need_w = (ow - 1) * sw + kw;
+    let reach = |o: usize, s: usize, k: usize| o.saturating_sub(1).checked_mul(s).and_then(|v| v.checked_add(k));
+    let (Some(need_h), Some(need_w)) = (reach(oh, sh, kh), reach(ow, sw, kw)) else { return Err(msg("a pooling window too large")) };
     let x = if need_h > h || need_w > w {
         if !max {
             return Err(msg("ceil-mode average pooling over a partial window is not supported"));
         }
+        // the pad is sized by the stride: check the padded tensor before allocating it
+        checked_elements(&[n, c, need_h.max(h), need_w.max(w)])?;
         x.pad_with_same(2, 0, need_h.saturating_sub(h))?.pad_with_same(3, 0, need_w.saturating_sub(w))?
     } else {
         x
@@ -1194,6 +1203,49 @@ mod tests {
         assert!(graph(&conv(&[1, 1, 2000, 1], &[attr_str("auto_pad", "SAME_UPPER")])).is_err());
         // an ordinary one still loads
         assert!(graph(&conv(&[1, 1, 3, 3], &[attr_str("auto_pad", "SAME_UPPER")])).is_ok());
+    }
+
+    /// A stride is bounded at load, like a dilation or a pad: the depthwise path allocates one phase per stride step, a
+    /// ceil-mode pool pads by it and a transposed convolution's output grows with it.
+    #[test]
+    fn a_huge_stride_is_refused_at_load() {
+        for strides in [[1 << 20, 1 << 20], [1 << 32, 1 << 32], [65, 1]] {
+            let attrs = [attr_int("group", 4), attr_ints("strides", &strides)];
+            assert!(graph(&conv(&[4, 1, 3, 3], &attrs)).is_err(), "depthwise {strides:?}");
+            let pool = model(
+                &[node("MaxPool", &["x"], &["y"], &[attr_ints("kernel_shape", &[2, 2]), attr_ints("strides", &strides), attr_int("ceil_mode", 1)])],
+                &[],
+                &["x"],
+                &["y"],
+            );
+            assert!(graph(&pool).is_err(), "pool {strides:?}");
+            let up = model(
+                &[node("ConvTranspose", &["x", "w"], &["y"], &[attr_ints("strides", &strides)])],
+                &[tensor_f32("w", &[1, 1, 2, 2], &[1.0; 4])],
+                &["x"],
+                &["y"],
+            );
+            assert!(graph(&up).is_err(), "transposed {strides:?}");
+        }
+        // the stride-2 layers of the real models still load
+        let attrs = [attr_int("group", 4), attr_ints("strides", &[2, 2])];
+        assert!(graph(&conv(&[4, 1, 3, 3], &attrs)).is_ok());
+        let up = model(
+            &[node("ConvTranspose", &["x", "w"], &["y"], &[attr_ints("strides", &[2, 2])])],
+            &[tensor_f32("w", &[1, 1, 2, 2], &[1.0; 4])],
+            &["x"],
+            &["y"],
+        );
+        assert!(graph(&up).is_ok());
+    }
+
+    /// The ceil-mode pad is sized by the stride: with a window that load would refuse, `pool` itself must still return an
+    /// error, not ask the allocator for terabytes.
+    #[test]
+    fn a_ceil_mode_pool_pad_is_checked() {
+        let win = super::Window { kernel: [1, 1], strides: [1 << 20, 1 << 20], dilation: 1, pads: super::Pads::Fixed([0; 4]) };
+        let x = Tensor::ones((1, 1, 2, 2), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(super::pool(&x, &win, true, true).is_err());
     }
 
     /// Shape's start / end (opset 15) would slice the dims; they are not implemented, so they fail at load.
