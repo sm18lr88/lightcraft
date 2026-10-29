@@ -7,8 +7,11 @@
 //! Unsqueeze, Concat, Slice) and the shape arithmetic (Shape, Gather, Slice and Concat on int64 vectors) that feeds
 //! Reshape its sizes; Constant nodes become constants at load. Unsupported operators, attributes and dangling value
 //! names fail at load, not in the middle of a run. Every operator that allocates a size the model file controls (see
-//! `MAX_RUNTIME_ELEMENTS`) checks it before candle does, so a hostile model is an error and never an out-of-memory abort.
+//! `MAX_RUNTIME_ELEMENTS`) checks it before candle does, and a run may hold at most `MAX_LIVE_ELEMENTS` at once (inputs,
+//! results not yet freed, retained outputs and the allocation being made), so a hostile model is an error and never an
+//! out-of-memory abort.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -39,6 +42,24 @@ const MAX_RUNTIME_ELEMENTS: usize = 1 << 30;
 /// small sets, the recogniser (6 lines of 48 × 3200) and the orientation classifier (32 lines of 80 × 160) all need less.
 /// A model that asks for more is an error, not an out-of-memory abort.
 const MAX_SCRATCH_ELEMENTS: usize = 1 << 32;
+/// Most elements one run may hold at once (2^32, 16 GiB of f32): the input, every value computed and not yet freed
+/// (graph outputs are never freed, so a run keeps all of them), and the allocation the running operator is about to
+/// make (its output, a padded copy or a scratch buffer). Every operator's allocation is checked against it with
+/// [`checked_elements`] / [`checked_scratch`] before candle allocates, and every result is checked again when it is
+/// stored, so a model that repeats one cheap node and keeps every result is an error naming the node, not an
+/// out-of-memory abort. Shared storage (a Reshape of a value) counts once per name: the total is an upper bound.
+///
+/// An operator that makes no check of its own (its output is no larger than an input) can exceed it by one result, at
+/// most [`MAX_RUNTIME_ELEMENTS`], before the stored-result check refuses it.
+///
+/// Why this number: a run holds the most at the operator that builds the biggest scratch buffer. The same accounting,
+/// measured on the real graphs at 1216 × 1600 (tiny 77.8 million, small 116.7 million, medium 311.3 million elements)
+/// and worked out from their shapes at the reader's largest 4000 × 4000 photo, gives a peak of 640 million (tiny),
+/// 960 million (small) and 2.56 billion (medium, 2.304 billion of it the Conv.121 scratch buffer). The recogniser (6
+/// lines of 48 × 3200) peaks at 33 to 103 million and the orientation classifier (32 lines of 80 × 160) at 4 million.
+/// 2^32 (4.29 billion) is 1.68 times the largest of them, so every shipped set passes at the largest photo with room to
+/// spare, and a model that keeps results or builds buffers past it is an error.
+const MAX_LIVE_ELEMENTS: usize = 1 << 32;
 /// Longest int64 vector (a shape, in practice a handful of values) Concat may build: the same vector can be named by
 /// every input and fed back through node after node.
 const MAX_SHAPE_LEN: usize = 1 << 16;
@@ -505,9 +526,18 @@ impl Graph {
 
     /// Runs the graph on its single input. The outputs, in the graph's order.
     pub fn run(&self, x: &Tensor) -> Result<Vec<Tensor>> {
+        self.run_within(x, MAX_LIVE_ELEMENTS).map(|(outputs, _)| outputs)
+    }
+
+    /// [`Graph::run`] holding at most `limit` elements at once; also the most it held (the checked allocations'
+    /// totals, the stored results').
+    fn run_within(&self, x: &Tensor, limit: usize) -> Result<(Vec<Tensor>, usize)> {
         let [name] = &self.inputs[..] else { return Err(msg(format!("the model has {} inputs, not one", self.inputs.len()))) };
         let mut env: HashMap<&str, Value> = HashMap::new();
-        env.insert(name.as_str(), Value::F(x.to_device(&self.device)?));
+        let input = Value::F(x.to_device(&self.device)?);
+        let mut live = held(&input);
+        let _scope = BudgetScope::enter(limit, live);
+        env.insert(name.as_str(), input);
         // LIGHTCRAFT_PROFILE=ops: the time of each operator type, waiting for the device after each node
         let profile = std::env::var("LIGHTCRAFT_PROFILE").is_ok_and(|v| v == "ops");
         let mut spent: HashMap<&str, (f64, usize)> = HashMap::new();
@@ -522,6 +552,7 @@ impl Graph {
                         Some(env.get(name.as_str()).or_else(|| self.consts.get(name)).ok_or_else(|| msg(format!("value {name:?} is missing")))?)
                     });
                 }
+                BudgetScope::set_live(live);
                 exec(&node.op, &args).map_err(|e| {
                     let m = match e {
                         Error::Model(m) | Error::Input(m) => m,
@@ -536,10 +567,23 @@ impl Graph {
                 e.0 += started.elapsed().as_secs_f64() * 1000.0;
                 e.1 += 1;
             }
+            // operators whose output is no larger than an input make no check of their own: the result is checked here
+            let with_result = live.checked_add(held(&out)).filter(|t| *t <= limit).ok_or_else(|| {
+                msg(format!(
+                    "node {} ({}): its result on top of the {live} elements the run already holds is over the {limit} it may hold at once",
+                    node.name, node.op_type
+                ))
+            })?;
+            BudgetScope::reach(with_result);
+            live = with_result;
             for f in &node.free {
-                env.remove(f.as_str());
+                if let Some(v) = env.remove(f.as_str()) {
+                    live = live.saturating_sub(held(&v));
+                }
             }
-            env.insert(node.output.as_str(), out);
+            if let Some(old) = env.insert(node.output.as_str(), out) {
+                live = live.saturating_sub(held(&old));
+            }
         }
         if profile {
             let mut rows: Vec<_> = spent.into_iter().collect();
@@ -554,7 +598,8 @@ impl Graph {
                 Some(Value::I(_)) => Err(msg(format!("output {o:?} is not a float tensor"))),
                 None => Err(msg(format!("output {o:?} was not computed"))),
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
+            .map(|outputs| (outputs, BudgetScope::peak()))
     }
 }
 
@@ -669,8 +714,73 @@ fn checked_scratch(dims: &[usize]) -> Result<usize> {
     checked_within(dims, MAX_SCRATCH_ELEMENTS)
 }
 
+/// What the running graph holds, for [`checked_within`]: the elements held now, the most it may hold, and the highest
+/// total any checked allocation reached. Thread-local so the operators' size checks need no extra parameter.
+#[derive(Clone, Copy)]
+struct Budget {
+    live: usize,
+    limit: usize,
+    peak: usize,
+}
+
+const NO_BUDGET: Budget = Budget { live: 0, limit: usize::MAX, peak: 0 };
+
+thread_local! {
+    static BUDGET: Cell<Budget> = const { Cell::new(NO_BUDGET) };
+}
+
+/// Installs a [`Budget`] for one run and removes it when the run ends, however it ends.
+struct BudgetScope;
+
+impl BudgetScope {
+    fn enter(limit: usize, live: usize) -> Self {
+        BUDGET.with(|b| b.set(Budget { live, limit, peak: live }));
+        BudgetScope
+    }
+
+    fn set_live(live: usize) {
+        BUDGET.with(|b| b.set(Budget { live, ..b.get() }));
+    }
+
+    /// Records a total the run reached, for the peak.
+    fn reach(total: usize) {
+        BUDGET.with(|b| {
+            let s = b.get();
+            b.set(Budget { peak: s.peak.max(total), ..s });
+        });
+    }
+
+    fn peak() -> usize {
+        BUDGET.with(|b| b.get().peak)
+    }
+}
+
+impl Drop for BudgetScope {
+    fn drop(&mut self) {
+        BUDGET.with(|b| b.set(NO_BUDGET));
+    }
+}
+
+/// Elements a value holds.
+fn held(v: &Value) -> usize {
+    match v {
+        Value::F(t) => t.elem_count(),
+        Value::I(v) => v.len(),
+    }
+}
+
 fn checked_within(dims: &[usize], limit: usize) -> Result<usize> {
-    dims.iter().try_fold(1usize, |a, d| a.checked_mul(*d)).filter(|n| *n <= limit).ok_or_else(|| msg(format!("a tensor of {dims:?} is too large")))
+    let n = dims
+        .iter()
+        .try_fold(1usize, |a, d| a.checked_mul(*d))
+        .filter(|n| *n <= limit)
+        .ok_or_else(|| msg(format!("a tensor of {dims:?} is too large")))?;
+    let b = BUDGET.with(Cell::get);
+    let total = b.live.checked_add(n).filter(|t| *t <= b.limit).ok_or_else(|| {
+        msg(format!("a tensor of {dims:?} on top of the {} elements the run already holds is over the {} it may hold at once", b.live, b.limit))
+    })?;
+    BudgetScope::reach(total);
+    Ok(n)
 }
 
 /// Every `step`-th index of `dim` from 0 (a stride candle's ops can't take directly).
@@ -1393,6 +1503,41 @@ mod tests {
         assert_eq!(run1(&graph(&m).unwrap(), x), vec![3.0; 8]);
     }
 
+    /// `n` MatMuls of the same two small initializers, each result a graph output under its own name: every output is
+    /// `side²` elements, well under any per-allocation ceiling, and none can be freed after its last reader.
+    fn retained_matmuls(n: usize, side: i64) -> Vec<u8> {
+        let names: Vec<String> = (0..n).map(|i| format!("y{i}")).collect();
+        let nodes: Vec<Vec<u8>> = names.iter().map(|y| node("MatMul", &["a", "b"], &[y.as_str()], &[])).collect();
+        let outs: Vec<&str> = names.iter().map(String::as_str).collect();
+        model(&nodes, &[ones("a", &[side, 1]), ones("b", &[1, side])], &["x"], &outs)
+    }
+
+    /// The aggregate budget: results a run keeps (graph outputs are never freed) count against what it may hold at once,
+    /// so repeating one cheap node cannot add up to an out-of-memory abort.
+    #[test]
+    fn retained_outputs_are_bounded_by_the_live_budget() {
+        let x = Tensor::zeros((1, 1), candle_core::DType::F32, &Device::Cpu).unwrap();
+        // ten outputs of 200 × 200 = 40 000 elements, plus the 1-element input: 400 001 held at the end
+        let g = graph(&retained_matmuls(10, 200)).unwrap();
+        let (outs, peak) = g.run_within(&x, 500_000).unwrap();
+        assert_eq!((outs.len(), peak), (10, 400_001));
+        // the eighth would take the run to 320 001 elements, over 300 000: an error naming the node, before it is stored
+        let e = g.run_within(&x, 300_000).unwrap_err().to_string();
+        assert!(e.contains("MatMul") && e.contains("at once"), "{e}");
+    }
+
+    /// Values freed after their last reader stop counting, and the peak is what the run held together.
+    #[test]
+    fn freed_values_do_not_count_against_the_live_budget() {
+        let x = Tensor::zeros((1, 1), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let nodes = [node("Add", &["a", "b"], &["y0"], &[]), node("Relu", &["y0"], &["y1"], &[]), node("Relu", &["y1"], &["y2"], &[])];
+        let m = model(&nodes, &[ones("a", &[3, 1]), ones("b", &[1, 4])], &["x"], &["y2"]);
+        let g = graph(&m).unwrap();
+        // input 1 + two live 12-element tensors at the most: 25, not the 37 of all three results together
+        assert_eq!(g.run_within(&x, 25).unwrap().1, 25);
+        assert!(g.run_within(&x, 24).is_err());
+    }
+
     /// BatchNormalization: per-channel parameters that are not one value per channel would broadcast the output to the
     /// parameters' size (a one-channel input with `K` parameters becomes `K` channels).
     #[test]
@@ -1449,6 +1594,8 @@ mod tests {
         assert_eq!(checked_scratch(&[1, 1000, 1000, 256, 3, 3]).unwrap(), 2_304_000_000);
         // the transposed convolution's column buffer of the same kind
         assert!(checked_scratch(&[1, 64, 3, 3, 1000, 1000]).is_ok());
+        // the medium detector's measured peak at 4000 × 4000 (the Conv.121 buffer and what the run holds with it)
+        const { assert!(2_560_000_000 <= super::MAX_LIVE_ELEMENTS) };
         assert!(checked_scratch(&[1, 65_536, 65_536, 16, 3, 3]).is_err());
         assert!(checked_scratch(&[usize::MAX, 2]).is_err());
         // outputs keep the lower ceiling
