@@ -7,9 +7,10 @@
 //! Unsqueeze, Concat, Slice) and the shape arithmetic (Shape, Gather, Slice and Concat on int64 vectors) that feeds
 //! Reshape its sizes; Constant nodes become constants at load. Unsupported operators, attributes and dangling value
 //! names fail at load, not in the middle of a run. Every operator that allocates a size the model file controls (see
-//! `MAX_RUNTIME_ELEMENTS`) checks it before candle does, and a run may hold at most `MAX_LIVE_ELEMENTS` at once (inputs,
-//! results not yet freed, retained outputs and the allocation being made), so a hostile model is an error and never an
-//! out-of-memory abort.
+//! `MAX_RUNTIME_ELEMENTS`) checks it before candle does, and a run may hold at most `MAX_LIVE_ELEMENTS` at once: its
+//! values (the input, results not yet freed, retained outputs) and, while an operator runs, every buffer that operator
+//! holds with them (a padded copy of its input, scratch, its output). A `Budget` made by each run counts both, so a
+//! hostile model is an error and never an out-of-memory abort.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -42,24 +43,23 @@ const MAX_RUNTIME_ELEMENTS: usize = 1 << 30;
 /// small sets, the recogniser (6 lines of 48 × 3200) and the orientation classifier (32 lines of 80 × 160) all need less.
 /// A model that asks for more is an error, not an out-of-memory abort.
 const MAX_SCRATCH_ELEMENTS: usize = 1 << 32;
-/// Most elements one run may hold at once (2^32, 16 GiB of f32): the input, every value computed and not yet freed
-/// (graph outputs are never freed, so a run keeps all of them), and the allocation the running operator is about to
-/// make (its output, a padded copy or a scratch buffer). Every operator's allocation is checked against it with
-/// [`checked_elements`] / [`checked_scratch`] before candle allocates, and every result is checked again when it is
-/// stored, so a model that repeats one cheap node and keeps every result is an error naming the node, not an
-/// out-of-memory abort. Shared storage (a Reshape of a value) counts once per name: the total is an upper bound.
+/// Most elements one run may hold at once (4.5 billion, 16.8 GiB of f32): the input, every value computed and not yet
+/// freed (graph outputs are never freed, so a run keeps all of them), and, while an operator runs, every buffer it holds
+/// at the same time: a padded copy of its input, the input laid out for candle, the scratch, the output and the
+/// intermediates that exist with them. `Budget` counts all of these in one total and refuses a request that would take it
+/// over the limit before the buffer is built; the buffers of an operator are given back when it finishes or fails, and
+/// its result is then counted as one of the run's values. A model that repeats one cheap node and keeps every result is
+/// an error naming the node, not an out-of-memory abort. Shared storage (a Reshape of a value) counts once per name:
+/// the total is an upper bound. Constants (initializers) are not counted: they are bounded by the size of the model file.
 ///
-/// An operator that makes no check of its own (its output is no larger than an input) can exceed it by one result, at
-/// most [`MAX_RUNTIME_ELEMENTS`], before the stored-result check refuses it.
-///
-/// Why this number: a run holds the most at the operator that builds the biggest scratch buffer. The same accounting,
-/// measured on the real graphs at 1216 × 1600 (tiny 77.8 million, small 116.7 million, medium 311.3 million elements)
-/// and worked out from their shapes at the reader's largest 4000 × 4000 photo, gives a peak of 640 million (tiny),
-/// 960 million (small) and 2.56 billion (medium, 2.304 billion of it the Conv.121 scratch buffer). The recogniser (6
-/// lines of 48 × 3200) peaks at 33 to 103 million and the orientation classifier (32 lines of 80 × 160) at 4 million.
-/// 2^32 (4.29 billion) is 1.68 times the largest of them, so every shipped set passes at the largest photo with room to
-/// spare, and a model that keeps results or builds buffers past it is an error.
-const MAX_LIVE_ELEMENTS: usize = 1 << 32;
+/// Why this number: it is the most the shipped models hold at once, measured, plus a margin. The same accounting run
+/// on the real graphs at the reader's largest 4000 × 4000 photo gives these highest totals: PP-OCRv6 tiny detector 720
+/// million elements, small 1.08 billion, medium 2.88 billion (about 2.3 billion of it the scratch of its widest 3 × 3
+/// convolution, Conv.121, with its padded input, the layout copy and the output beside it). The recogniser (6 lines of
+/// 48 × 3200) peaks at 180 million in the small and medium sets (66 million in tiny) and the orientation classifier (32
+/// lines of 80 × 160) at 7.5 million. 4.5 billion is 1.56 times the largest of them, so every shipped set passes at the
+/// largest photo with room to spare, and a model that keeps results or builds buffers past it is an error.
+const MAX_LIVE_ELEMENTS: usize = 4_500_000_000;
 /// Longest int64 vector (a shape, in practice a handful of values) Concat may build: the same vector can be named by
 /// every input and fed back through node after node.
 const MAX_SHAPE_LEN: usize = 1 << 16;
@@ -529,14 +529,13 @@ impl Graph {
         self.run_within(x, MAX_LIVE_ELEMENTS).map(|(outputs, _)| outputs)
     }
 
-    /// [`Graph::run`] holding at most `limit` elements at once; also the most it held (the checked allocations'
-    /// totals, the stored results').
+    /// [`Graph::run`] holding at most `limit` elements at once; also the most it held (see [`Budget`]).
     fn run_within(&self, x: &Tensor, limit: usize) -> Result<(Vec<Tensor>, usize)> {
         let [name] = &self.inputs[..] else { return Err(msg(format!("the model has {} inputs, not one", self.inputs.len()))) };
         let mut env: HashMap<&str, Value> = HashMap::new();
         let input = Value::F(x.to_device(&self.device)?);
-        let mut live = held(&input);
-        let _scope = BudgetScope::enter(limit, live);
+        let budget = Budget::new(limit);
+        budget.hold(held(&input))?;
         env.insert(name.as_str(), input);
         // LIGHTCRAFT_PROFILE=ops: the time of each operator type, waiting for the device after each node
         let profile = std::env::var("LIGHTCRAFT_PROFILE").is_ok_and(|v| v == "ops");
@@ -552,14 +551,7 @@ impl Graph {
                         Some(env.get(name.as_str()).or_else(|| self.consts.get(name)).ok_or_else(|| msg(format!("value {name:?} is missing")))?)
                     });
                 }
-                BudgetScope::set_live(live);
-                exec(&node.op, &args).map_err(|e| {
-                    let m = match e {
-                        Error::Model(m) | Error::Input(m) => m,
-                        other => other.to_string(),
-                    };
-                    msg(format!("node {} ({}): {m}", node.name, node.op_type))
-                })?
+                exec(&budget, &node.op, &args).map_err(|e| node_error(node, e))?
             };
             if profile {
                 self.device.synchronize()?;
@@ -567,22 +559,16 @@ impl Graph {
                 e.0 += started.elapsed().as_secs_f64() * 1000.0;
                 e.1 += 1;
             }
-            // operators whose output is no larger than an input make no check of their own: the result is checked here
-            let with_result = live.checked_add(held(&out)).filter(|t| *t <= limit).ok_or_else(|| {
-                msg(format!(
-                    "node {} ({}): its result on top of the {live} elements the run already holds is over the {limit} it may hold at once",
-                    node.name, node.op_type
-                ))
-            })?;
-            BudgetScope::reach(with_result);
-            live = with_result;
+            // the operator's reservations are gone: its result is now one of the run's values (an operator that only
+            // returns a view of an input reserved nothing, and its result is checked here)
+            budget.hold(held(&out)).map_err(|e| node_error(node, e))?;
             for f in &node.free {
                 if let Some(v) = env.remove(f.as_str()) {
-                    live = live.saturating_sub(held(&v));
+                    budget.release(held(&v));
                 }
             }
             if let Some(old) = env.insert(node.output.as_str(), out) {
-                live = live.saturating_sub(held(&old));
+                budget.release(held(&old));
             }
         }
         if profile {
@@ -599,8 +585,17 @@ impl Graph {
                 None => Err(msg(format!("output {o:?} was not computed"))),
             })
             .collect::<Result<Vec<_>>>()
-            .map(|outputs| (outputs, BudgetScope::peak()))
+            .map(|outputs| (outputs, budget.peak()))
     }
+}
+
+/// `e` raised by `node`, named.
+fn node_error(node: &Node, e: Error) -> Error {
+    let m = match e {
+        Error::Model(m) | Error::Input(m) => m,
+        other => other.to_string(),
+    };
+    msg(format!("node {} ({}): {m}", node.name, node.op_type))
 }
 
 fn arg<'a>(a: &[Option<&'a Value>], i: usize) -> Option<&'a Value> {
@@ -623,28 +618,46 @@ fn ints<'a>(a: &[Option<&'a Value>], i: usize) -> Result<&'a [i64]> {
     }
 }
 
-/// `t` with leading 1s up to rank `r` (numpy-style broadcasting aligns trailing dims).
+/// `t`'s dims with leading 1s up to rank `r` (numpy-style broadcasting aligns trailing dims).
+fn lifted_dims(t: &Tensor, r: usize) -> Vec<usize> {
+    let mut d = vec![1; r.saturating_sub(t.rank())];
+    d.extend_from_slice(t.dims());
+    d
+}
+
+/// `t` with leading 1s up to rank `r`.
 fn lift(t: &Tensor, r: usize) -> Result<Tensor> {
     if t.rank() >= r {
         return Ok(t.clone());
     }
-    let mut d = vec![1; r - t.rank()];
-    d.extend_from_slice(t.dims());
-    Ok(t.reshape(d)?)
+    Ok(t.reshape(lifted_dims(t, r))?)
 }
 
-/// Both operands lifted to a common rank; the broadcast result (the per-axis maximum) is checked against the limit.
-fn broadcast(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
+/// The sum of `parts`, checked.
+fn total(parts: &[usize]) -> Result<usize> {
+    parts.iter().try_fold(0usize, |s, p| s.checked_add(*p)).ok_or_else(|| msg("a size too large"))
+}
+
+/// `n` times `k`, checked.
+fn times(n: usize, k: usize) -> Result<usize> {
+    n.checked_mul(k).ok_or_else(|| msg("a size too large"))
+}
+
+/// Both operands lifted to a common rank, with the broadcast result (the per-axis maximum, checked against the
+/// per-tensor ceiling) and the copies lifting a non-contiguous operand makes reserved until the returned guard drops.
+fn broadcast<'b>(budget: &'b Budget, a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor, Reservation<'b>)> {
     let r = a.rank().max(b.rank());
-    let (a, b) = (lift(a, r)?, lift(b, r)?);
-    let out: Vec<usize> = a.dims().iter().zip(b.dims()).map(|(x, y)| *x.max(y)).collect();
-    checked_elements(&out)?;
-    Ok((a, b))
+    let out: Vec<usize> = lifted_dims(a, r).iter().zip(lifted_dims(b, r)).map(|(x, y)| *x.max(&y)).collect();
+    let result = checked_elements(&out)?;
+    let copies = [a, b].into_iter().filter(|t| t.rank() < r && !t.is_contiguous()).map(Tensor::elem_count).sum::<usize>();
+    let held = budget.reserve(total(&[result, copies])?)?;
+    Ok((lift(a, r)?, lift(b, r)?, held))
 }
 
-/// The output of a matrix product (batch dimensions broadcast, then `[m, n]`) and the two operands candle expands to it,
-/// checked against the limit.
-fn check_matmul(x: &Tensor, y: &Tensor) -> Result<()> {
+/// The elements a matrix product holds: its output (batch dimensions broadcast, then `[m, n]`) and the operands candle
+/// may expand to that batch. Every one of those shapes is checked against the per-tensor ceiling; nothing is reserved
+/// here.
+fn check_matmul(x: &Tensor, y: &Tensor) -> Result<usize> {
     let (Some((bx, mk)), Some((by, kn))) =
         (x.dims().split_at_checked(x.rank().saturating_sub(2)), y.dims().split_at_checked(y.rank().saturating_sub(2)))
     else {
@@ -658,16 +671,21 @@ fn check_matmul(x: &Tensor, y: &Tensor) -> Result<()> {
     // batch dimensions align on the right, missing ones are 1
     let side = |b: &[usize], i: usize| (i + b.len()).checked_sub(nb).and_then(|j| b.get(j)).copied().unwrap_or(1);
     let batch: Vec<usize> = (0..nb).map(|i| side(bx, i).max(side(by, i))).collect();
-    for rest in [[m, n], [m, k], [k, n]] {
+    let mut sizes = [0usize; 3];
+    for (size, rest) in sizes.iter_mut().zip([[m, n], [m, k], [k, n]]) {
         let mut dims = batch.clone();
         dims.extend(rest);
-        checked_elements(&dims)?;
+        *size = checked_elements(&dims)?;
     }
-    Ok(())
+    let [result, lhs, rhs] = sizes;
+    // an operand whose batch dimensions are not the broadcast ones is expanded to them
+    let expanded = |b: &[usize], size: usize| if b == batch.as_slice() { 0 } else { size };
+    total(&[result, expanded(bx, lhs), expanded(by, rhs)])
 }
 
-/// `y` plus a per-channel bias. A bias that is not one value per channel would broadcast the output larger.
-fn add_bias(y: Tensor, a: &[Option<&Value>]) -> Result<Tensor> {
+/// `y` plus a per-channel bias. A bias that is not one value per channel would broadcast the output larger. The sum is a
+/// second buffer of `y`'s size while `y` is alive.
+fn add_bias(budget: &Budget, y: Tensor, a: &[Option<&Value>]) -> Result<Tensor> {
     if arg(a, 2).is_none() {
         return Ok(y);
     }
@@ -676,6 +694,7 @@ fn add_bias(y: Tensor, a: &[Option<&Value>]) -> Result<Tensor> {
     if bias.elem_count() != c {
         return Err(msg(format!("a bias of {} values for {c} channels", bias.elem_count())));
     }
+    let _sum = budget.reserve(y.elem_count())?;
     Ok(y.broadcast_add(&bias.reshape((1, c, 1, 1))?)?)
 }
 
@@ -696,15 +715,19 @@ fn slice_range(start: i64, end: i64, len: usize) -> (usize, usize) {
 
 /// `x` in a layout candle's CPU conv2d reads correctly. Its tiled im2col path assumes an input with strides
 /// `[h·w·c, w·c, c, 1]` is stored channels-last; a contiguous NCHW tensor with c = h = w has exactly those strides and
-/// would be misread. The same values with channels-last storage can't be mistaken.
-fn conv_safe_layout(x: &Tensor) -> Result<Tensor> {
+/// would be misread. The same values with channels-last storage can't be mistaken. That copy of `x` is reserved until
+/// the returned guard drops.
+fn conv_safe_layout<'b>(budget: &'b Budget, x: &Tensor) -> Result<(Tensor, Option<Reservation<'b>>)> {
     let (_, c, h, w) = x.dims4()?;
     if x.device().is_cpu() && c > 1 && x.stride() == [h * w * c, w * c, c, 1] {
-        return Ok(x.permute((0, 2, 3, 1))?.contiguous()?.permute((0, 3, 1, 2))?);
+        let copy = budget.reserve(x.elem_count())?;
+        return Ok((x.permute((0, 2, 3, 1))?.contiguous()?.permute((0, 3, 1, 2))?, Some(copy)));
     }
-    Ok(x.clone())
+    Ok((x.clone(), None))
 }
 
+/// The elements of a tensor of `dims`, checked against [`MAX_RUNTIME_ELEMENTS`]. A shape check only: it reserves nothing
+/// (see [`Budget::tensor`]).
 fn checked_elements(dims: &[usize]) -> Result<usize> {
     checked_within(dims, MAX_RUNTIME_ELEMENTS)
 }
@@ -714,51 +737,8 @@ fn checked_scratch(dims: &[usize]) -> Result<usize> {
     checked_within(dims, MAX_SCRATCH_ELEMENTS)
 }
 
-/// What the running graph holds, for [`checked_within`]: the elements held now, the most it may hold, and the highest
-/// total any checked allocation reached. Thread-local so the operators' size checks need no extra parameter.
-#[derive(Clone, Copy)]
-struct Budget {
-    live: usize,
-    limit: usize,
-    peak: usize,
-}
-
-const NO_BUDGET: Budget = Budget { live: 0, limit: usize::MAX, peak: 0 };
-
-thread_local! {
-    static BUDGET: Cell<Budget> = const { Cell::new(NO_BUDGET) };
-}
-
-/// Installs a [`Budget`] for one run and removes it when the run ends, however it ends.
-struct BudgetScope;
-
-impl BudgetScope {
-    fn enter(limit: usize, live: usize) -> Self {
-        BUDGET.with(|b| b.set(Budget { live, limit, peak: live }));
-        BudgetScope
-    }
-
-    fn set_live(live: usize) {
-        BUDGET.with(|b| b.set(Budget { live, ..b.get() }));
-    }
-
-    /// Records a total the run reached, for the peak.
-    fn reach(total: usize) {
-        BUDGET.with(|b| {
-            let s = b.get();
-            b.set(Budget { peak: s.peak.max(total), ..s });
-        });
-    }
-
-    fn peak() -> usize {
-        BUDGET.with(|b| b.get().peak)
-    }
-}
-
-impl Drop for BudgetScope {
-    fn drop(&mut self) {
-        BUDGET.with(|b| b.set(NO_BUDGET));
-    }
+fn checked_within(dims: &[usize], limit: usize) -> Result<usize> {
+    dims.iter().try_fold(1usize, |a, d| a.checked_mul(*d)).filter(|n| *n <= limit).ok_or_else(|| msg(format!("a tensor of {dims:?} is too large")))
 }
 
 /// Elements a value holds.
@@ -769,18 +749,119 @@ fn held(v: &Value) -> usize {
     }
 }
 
-fn checked_within(dims: &[usize], limit: usize) -> Result<usize> {
-    let n = dims
-        .iter()
-        .try_fold(1usize, |a, d| a.checked_mul(*d))
-        .filter(|n| *n <= limit)
-        .ok_or_else(|| msg(format!("a tensor of {dims:?} is too large")))?;
-    let b = BUDGET.with(Cell::get);
-    let total = b.live.checked_add(n).filter(|t| *t <= b.limit).ok_or_else(|| {
-        msg(format!("a tensor of {dims:?} on top of the {} elements the run already holds is over the {} it may hold at once", b.live, b.limit))
-    })?;
-    BudgetScope::reach(total);
-    Ok(n)
+/// The elements one run holds at once, against the most it may hold ([`MAX_LIVE_ELEMENTS`] in a real run). It is made by
+/// [`Graph::run`] and passed to every operator that allocates, so nothing about it is global.
+///
+/// Two kinds of element are counted in one total, `held`:
+/// - The run's values: the input and every operator result not yet freed, including the graph outputs, which are never
+///   freed. [`Budget::hold`] adds a result when it is stored and [`Budget::release`] takes it off when it is freed. A
+///   value shared with another (a Reshape of it) counts once per name, so the total is an upper bound.
+/// - An operator's buffers: [`Budget::reserve`] adds the elements of a buffer the operator is about to allocate and
+///   returns a [`Reservation`] that takes them off when it drops. An operator reserves every buffer that exists at the
+///   same time (a padded copy of the input, the scratch, the output) before building them, and keeps the guards until
+///   its result exists, so the total at any point is what the process really holds there, and an error at any `?`
+///   releases them. The operator's own reservations are gone before the run stores its result with `hold`.
+///
+/// A request that would take `held` over the limit is an error naming it; `peak` is the highest `held` reached.
+///
+/// Not counted: constants and initializers (bounded by the model file's size, read at load); the vectors of
+/// per-channel parameters and shape tuples, a few values per tensor dimension; and what candle allocates inside one
+/// kernel beyond the buffers named at the call (a tiled convolution's per-thread tiles, a pooling kernel's window
+/// state). A Softmax's three buffers, a mean's sum and quotient and a convolution's channels-last copy of the input are
+/// reserved because they are tensors the call holds, not because they are candle's own.
+struct Budget {
+    limit: usize,
+    held: Cell<usize>,
+    peak: Cell<usize>,
+}
+
+/// Elements a [`Budget`] has lent to a buffer; given back when it drops.
+struct Reservation<'a> {
+    budget: &'a Budget,
+    n: usize,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.n);
+    }
+}
+
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self { limit, held: Cell::new(0), peak: Cell::new(0) }
+    }
+
+    /// The elements held now.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.held.get()
+    }
+
+    /// The most elements held at any point.
+    fn peak(&self) -> usize {
+        self.peak.get()
+    }
+
+    /// Adds `n` elements, described by `what` if that would be over the limit.
+    fn add(&self, n: usize, what: impl FnOnce() -> String) -> Result<()> {
+        let held = self.held.get();
+        let total = held.checked_add(n).filter(|t| *t <= self.limit).ok_or_else(|| {
+            msg(format!("{} on top of the {held} elements the run already holds is over the {} it may hold at once", what(), self.limit))
+        })?;
+        self.held.set(total);
+        self.peak.set(self.peak.get().max(total));
+        Ok(())
+    }
+
+    /// Counts a result the run keeps until [`Budget::release`].
+    fn hold(&self, n: usize) -> Result<()> {
+        self.add(n, || format!("a result of {n} elements"))
+    }
+
+    fn release(&self, n: usize) {
+        self.held.set(self.held.get().saturating_sub(n));
+    }
+
+    /// Lends `n` elements to a buffer about to be allocated.
+    fn reserve(&self, n: usize) -> Result<Reservation<'_>> {
+        self.add(n, || format!("{n} more elements"))?;
+        Ok(Reservation { budget: self, n })
+    }
+
+    /// [`Budget::reserve`] for a tensor of `dims`, which is also checked against [`MAX_RUNTIME_ELEMENTS`].
+    fn tensor(&self, dims: &[usize]) -> Result<Reservation<'_>> {
+        let n = checked_elements(dims)?;
+        self.add(n, || format!("a tensor of {dims:?}"))?;
+        Ok(Reservation { budget: self, n })
+    }
+
+    /// [`Budget::reserve`] for a scratch buffer of `dims`, which is also checked against [`MAX_SCRATCH_ELEMENTS`].
+    fn scratch(&self, dims: &[usize]) -> Result<Reservation<'_>> {
+        let n = checked_scratch(dims)?;
+        self.add(n, || format!("a scratch buffer of {dims:?}"))?;
+        Ok(Reservation { budget: self, n })
+    }
+}
+
+/// `x` padded by (top, left, bottom, right) with zeros, or with its edge values (`edge`). Reserves the padded copy, and
+/// while it is built the copy with only the rows padded; the guard for the padded copy is returned.
+fn pad2<'b>(budget: &'b Budget, x: &Tensor, [t, l, b, r]: [usize; 4], edge: bool) -> Result<(Tensor, Reservation<'b>)> {
+    let (n, c, h, w) = x.dims4()?;
+    let (padded_h, padded_w) = (total(&[h, t, b])?, total(&[w, l, r])?);
+    let padded = budget.tensor(&[n, c, padded_h, padded_w])?;
+    let pad = |x: &Tensor, dim: usize, before: usize, after: usize| -> Result<Tensor> {
+        Ok(if edge { x.pad_with_same(dim, before, after)? } else { x.pad_with_zeros(dim, before, after)? })
+    };
+    // the rows-padded copy lives until the columns are padded too
+    let (rows, _rows_guard) = if total(&[t, b])? > 0 {
+        let guard = budget.tensor(&[n, c, padded_h, w])?;
+        (pad(x, 2, t, b)?, Some(guard))
+    } else {
+        (x.clone(), None)
+    };
+    let out = if total(&[l, r])? > 0 { pad(&rows, 3, l, r)? } else { rows };
+    Ok((out, padded))
 }
 
 /// Every `step`-th index of `dim` from 0 (a stride candle's ops can't take directly).
@@ -801,12 +882,18 @@ fn out_len(len: usize, k: usize, s: usize, ceil: bool) -> Result<usize> {
     Ok(if ceil { span.div_ceil(s) } else { span / s } + 1)
 }
 
-fn pool(x: &Tensor, win: &Window, ceil: bool, max: bool) -> Result<Tensor> {
+/// A pooling window over `x`. Holds the padded copy of `x` (and the ceil-mode extension of it) and the output at once.
+fn pool(budget: &Budget, x: &Tensor, win: &Window, ceil: bool, max: bool) -> Result<Tensor> {
     let (n, c, h, w) = x.dims4()?;
     let [t, l, b, r] = win.pads(h, w)?;
     checked_elements(&[n, c, h.saturating_add(t).saturating_add(b), w.saturating_add(l).saturating_add(r)])?;
     // max pooling: padding with the edge values never wins over a real value, as ONNX's -inf padding
-    let x = if t + l + b + r > 0 { x.pad_with_same(2, t, b)?.pad_with_same(3, l, r)? } else { x.clone() };
+    let (x, _padded) = if total(&[t, l, b, r])? > 0 {
+        let (padded, guard) = pad2(budget, x, [t, l, b, r], true)?;
+        (padded, Some(guard))
+    } else {
+        (x.clone(), None)
+    };
     let (_, _, h, w) = x.dims4()?;
     let ([kh, kw], [sh, sw]) = (win.kernel, win.strides);
     if win.dilation != 1 {
@@ -816,16 +903,17 @@ fn pool(x: &Tensor, win: &Window, ceil: bool, max: bool) -> Result<Tensor> {
     // ceil mode: the last window may run past the edge; extend with edge values (max) — averages are refused there
     let reach = |o: usize, s: usize, k: usize| o.saturating_sub(1).checked_mul(s).and_then(|v| v.checked_add(k));
     let (Some(need_h), Some(need_w)) = (reach(oh, sh, kh), reach(ow, sw, kw)) else { return Err(msg("a pooling window too large")) };
-    let x = if need_h > h || need_w > w {
+    let (x, _extended) = if need_h > h || need_w > w {
         if !max {
             return Err(msg("ceil-mode average pooling over a partial window is not supported"));
         }
-        // the pad is sized by the stride: check the padded tensor before allocating it
-        checked_elements(&[n, c, need_h.max(h), need_w.max(w)])?;
-        x.pad_with_same(2, 0, need_h.saturating_sub(h))?.pad_with_same(3, 0, need_w.saturating_sub(w))?
+        // the pad is sized by the stride: reserved (and checked) before it is allocated
+        let (extended, guard) = pad2(budget, &x, [0, 0, need_h.saturating_sub(h), need_w.saturating_sub(w)], true)?;
+        (extended, Some(guard))
     } else {
-        x
+        (x, None)
     };
+    let _out = budget.tensor(&[n, c, oh, ow])?;
     // stride 1 windows, then every stride-th one (candle's pooling takes one stride per axis but equal kernels)
     let y = if max { x.max_pool2d_with_stride((kh, kw), (sh, sw))? } else { x.avg_pool2d_with_stride((kh, kw), (sh, sw))? };
     Ok(y.narrow(2, 0, oh.min(y.dim(2)?))?.narrow(3, 0, ow.min(y.dim(3)?))?)
@@ -835,9 +923,18 @@ fn pool(x: &Tensor, win: &Window, ceil: bool, max: bool) -> Result<Tensor> {
 /// the tap's offset times that tap's per-channel weight. candle runs a grouped convolution as one convolution per group
 /// (hundreds of small kernels for a depthwise layer, very slow on a graphics card); this is `kh × kw` whole-tensor
 /// operations instead.
-fn depthwise(x: &Tensor, w: &Tensor, pad: usize, [sh, sw]: [usize; 2], dilation: usize) -> Result<Tensor> {
-    let x = if pad > 0 { x.pad_with_zeros(2, pad, pad)?.pad_with_zeros(3, pad, pad)? } else { x.clone() };
-    let (_, c, h, wd) = x.dims4()?;
+///
+/// The caller has reserved the output. This reserves what else exists with it: the padded input, each phase (and the copies
+/// made while one is built), and the two other buffers of the running sum (the sum so far, the tap's term and their new
+/// sum exist together).
+fn depthwise(budget: &Budget, x: &Tensor, w: &Tensor, pad: usize, [sh, sw]: [usize; 2], dilation: usize) -> Result<Tensor> {
+    let (x, _padded) = if pad > 0 {
+        let (padded, guard) = pad2(budget, x, [pad; 4], false)?;
+        (padded, Some(guard))
+    } else {
+        (x.clone(), None)
+    };
+    let (n, c, h, wd) = x.dims4()?;
     let (_, _, kh, kw) = w.dims4()?;
     if kh == 0 || kw == 0 || dilation == 0 {
         return Err(msg("an empty kernel"));
@@ -847,10 +944,12 @@ fn depthwise(x: &Tensor, w: &Tensor, pad: usize, [sh, sw]: [usize; 2], dilation:
         return Err(msg(format!("a feature map of {h}×{wd} is smaller than the window of {eh}×{ew}")));
     }
     let (oh, ow) = ((h - eh) / sh + 1, (wd - ew) / sw + 1);
+    let _terms = if kh * kw > 1 { Some(budget.reserve(times(checked_elements(&[n, c, oh, ow])?, 2)?)?) } else { None };
     let taps = w.reshape((c, kh * kw))?.t()?.contiguous()?;
     // with a stride, the input's sh × sw phases (every sh-th row from row pi, every sw-th column from column pj), each
     // made once: a tap at offset (oi, oj) reads phase (oi % sh, oj % sw) from (oi / sh, oj / sw)
     let mut phases: Vec<Option<Tensor>> = vec![None; sh * sw];
+    let mut phase_guards = Vec::new();
     let mut acc: Option<Tensor> = None;
     for i in 0..kh {
         for j in 0..kw {
@@ -860,8 +959,17 @@ fn depthwise(x: &Tensor, w: &Tensor, pad: usize, [sh, sw]: [usize; 2], dilation:
             let phase = match slot {
                 Some(p) => p.clone(),
                 None => {
+                    let (rows, cols) = ((h - pi).div_ceil(sh), (wd - pj).div_ceil(sw));
+                    // with a stride the phase is a copy that stays; the shifted copy it is picked from and the rows picked
+                    // first exist while it is built (without one the phase is a view of the input)
+                    let _building = if sh * sw > 1 {
+                        phase_guards.push(budget.tensor(&[n, c, rows, cols])?);
+                        Some((budget.tensor(&[n, c, h - pi, wd - pj])?, budget.tensor(&[n, c, rows, wd - pj])?))
+                    } else {
+                        None
+                    };
                     let v = x.narrow(2, pi, h - pi)?.narrow(3, pj, wd - pj)?.contiguous()?;
-                    let p = every(&every(&v, 2, sh, (h - pi).div_ceil(sh))?, 3, sw, (wd - pj).div_ceil(sw))?;
+                    let p = every(&every(&v, 2, sh, rows)?, 3, sw, cols)?;
                     slot.insert(p).clone()
                 }
             };
@@ -877,7 +985,16 @@ fn depthwise(x: &Tensor, w: &Tensor, pad: usize, [sh, sw]: [usize; 2], dilation:
     acc.ok_or_else(|| msg("an empty kernel"))
 }
 
-fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
+/// An element-wise operator over the first input: `buffers` tensors of its size are reserved before `f` builds them.
+fn unary(budget: &Budget, a: &[Option<&Value>], buffers: usize, f: impl FnOnce(&Tensor) -> candle_core::Result<Tensor>) -> Result<Tensor> {
+    let x = tensor(a, 0)?;
+    let _held = budget.reserve(times(x.elem_count(), buffers)?)?;
+    Ok(f(x)?)
+}
+
+/// Runs one operator. Every buffer it holds at once is reserved in `budget` before it is built and stays reserved until
+/// the result exists; an operator that only returns a view of an input reserves nothing.
+fn exec(budget: &Budget, op: &Op, a: &[Option<&Value>]) -> Result<Value> {
     let out = match op {
         Op::Conv { window: win, groups } => {
             let (x, w) = (tensor(a, 0)?, tensor(a, 1)?);
@@ -894,35 +1011,63 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
                 return Err(msg(format!("a feature map of {ph}×{pw} is smaller than the window of {eh}×{ew}")));
             }
             checked_elements(&[batch, chans, ph, pw])?;
-            let (x, p) = if t == l && l == b && b == r { (x.clone(), t) } else { (x.pad_with_zeros(2, t, b)?.pad_with_zeros(3, l, r)?, 0) };
             let [sh, sw] = win.strides;
+            let uniform = t == l && l == b && b == r;
+            let p = if uniform { t } else { 0 };
             let depthwise_path = *groups > 1 && c_in_k == 1 && c_out == *groups && chans == *groups;
             let pointwise_path = *groups == 1 && (kh, kw, sh, sw, p) == (1, 1, 1, 1, 0);
             // the output has the weights' channels, so it can be far larger than the input; unequal strides first build
             // the stride-1 output; the general path builds an im2col buffer of one kernel's taps per output position
             let (oh, ow) = (ph.saturating_sub(eh) / sh + 1, pw.saturating_sub(ew) / sw + 1);
             let (ah, aw) = if sh == sw || depthwise_path { (oh, ow) } else { (ph.saturating_sub(eh) + 1, pw.saturating_sub(ew) + 1) };
-            checked_elements(&[batch, c_out, ah, aw])?;
-            if !depthwise_path && !pointwise_path {
+            let out = checked_elements(&[batch, c_out, ah, aw])?;
+            let general = !depthwise_path && !pointwise_path;
+            if general {
                 checked_scratch(&[batch, ah, aw, c_in_k, kh, kw])?;
             }
+            // Every buffer the convolution holds at once is reserved before it is built and kept until its result exists:
+            // the padded input when the pads are not equal (equal ones are made inside the convolution), the output (for
+            // unequal strides the stride-1 output, then the rows and the result picked from it), and below, per path,
+            // what that path needs besides.
+            let (x, _padded) = if uniform {
+                (x.clone(), None)
+            } else {
+                let (padded, guard) = pad2(budget, x, [t, l, b, r], false)?;
+                (padded, Some(guard))
+            };
+            let _out = budget.reserve(out)?;
+            let _picked = if (ah, aw) == (oh, ow) {
+                None
+            } else {
+                Some(budget.reserve(total(&[checked_elements(&[batch, c_out, oh, aw])?, checked_elements(&[batch, c_out, oh, ow])?])?)?)
+            };
             let y = if depthwise_path {
-                depthwise(&x, w, p, [sh, sw], win.dilation)?
+                depthwise(budget, &x, w, p, [sh, sw], win.dilation)?
             } else if pointwise_path {
                 // a pointwise convolution is one matrix product ([c_out, c_in] × [c_in, h·w] per image), not im2col
                 let (n, c, h, wd) = x.dims4()?;
+                let _contiguous = if x.is_contiguous() { None } else { Some(budget.reserve(x.elem_count())?) };
                 let y = w.reshape((c_out, c))?.broadcast_matmul(&x.reshape((n, c, h * wd))?)?;
                 y.reshape((n, c_out, h, wd))?
-            } else if sh == sw {
-                conv_safe_layout(&x)?.conv2d(w, p, sh, win.dilation, *groups)?
             } else {
-                // unequal strides: the stride-1 convolution, then every sh-th row and sw-th column
-                let y = conv_safe_layout(&x)?.conv2d(w, p, 1, win.dilation, *groups)?;
-                let (_, _, yh, yw) = y.dims4()?;
-                let y = every(&y, 2, sh, (yh - 1) / sh + 1)?;
-                every(&y, 3, sw, (yw - 1) / sw + 1)?
+                // candle lays the input out channels-last (a copy), builds the scratch, and runs a grouped convolution
+                // group by group, concatenating the results (a second buffer of the output's size). The scratch is the
+                // whole im2col buffer: the most any backend builds (the CPU's tiled kernel builds less).
+                let _layout = budget.reserve(x.elem_count())?;
+                let _scratch = budget.scratch(&[batch, ah, aw, c_in_k, kh, kw])?;
+                let _concat = if *groups > 1 { Some(budget.reserve(out)?) } else { None };
+                let (xl, _safe) = conv_safe_layout(budget, &x)?;
+                if sh == sw {
+                    xl.conv2d(w, p, sh, win.dilation, *groups)?
+                } else {
+                    // unequal strides: the stride-1 convolution, then every sh-th row and sw-th column
+                    let y = xl.conv2d(w, p, 1, win.dilation, *groups)?;
+                    let (_, _, yh, yw) = y.dims4()?;
+                    let y = every(&y, 2, sh, (yh - 1) / sh + 1)?;
+                    every(&y, 3, sw, (yw - 1) / sw + 1)?
+                }
             };
-            add_bias(y, a)?
+            add_bias(budget, y, a)?
         }
         Op::ConvTranspose { stride } => {
             let (x, w) = (tensor(a, 0)?, tensor(a, 1)?);
@@ -935,29 +1080,34 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             let grown = |len: usize, k: usize| {
                 len.saturating_sub(1).checked_mul(*stride).and_then(|v| v.checked_add(k)).ok_or_else(|| msg("a transposed convolution too large"))
             };
-            checked_elements(&[n, c_out, grown(h, kh)?, grown(wd, kw)?])?;
-            checked_scratch(&[n, c_out, kh, kw, h, wd])?;
-            add_bias(x.contiguous()?.conv_transpose2d(&w.contiguous()?, 0, 0, *stride, 1)?, a)?
+            let out = checked_elements(&[n, c_out, grown(h, kh)?, grown(wd, kw)?])?;
+            // the output, the column buffer, and the input laid out for the product (a copy)
+            let _out = budget.reserve(out)?;
+            let _scratch = budget.scratch(&[n, c_out, kh, kw, h, wd])?;
+            let _layout = budget.reserve(x.elem_count())?;
+            let y = x.contiguous()?.conv_transpose2d(&w.contiguous()?, 0, 0, *stride, 1)?;
+            add_bias(budget, y, a)?
         }
-        Op::Relu => tensor(a, 0)?.relu()?,
-        Op::Sigmoid => candle_nn::ops::sigmoid(tensor(a, 0)?)?,
-        Op::HardSigmoid { alpha, beta } => tensor(a, 0)?.affine(*alpha, *beta)?.clamp(0f32, 1f32)?,
-        Op::Erf => tensor(a, 0)?.erf()?,
-        Op::Sqrt => tensor(a, 0)?.sqrt()?,
+        Op::Relu => unary(budget, a, 1, Tensor::relu)?,
+        Op::Sigmoid => unary(budget, a, 1, candle_nn::ops::sigmoid)?,
+        // the scaled values and the clamped ones exist together
+        Op::HardSigmoid { alpha, beta } => unary(budget, a, 2, |x| x.affine(*alpha, *beta)?.clamp(0f32, 1f32))?,
+        Op::Erf => unary(budget, a, 1, Tensor::erf)?,
+        Op::Sqrt => unary(budget, a, 1, Tensor::sqrt)?,
         Op::Add => {
-            let (x, y) = broadcast(tensor(a, 0)?, tensor(a, 1)?)?;
+            let (x, y, _held) = broadcast(budget, tensor(a, 0)?, tensor(a, 1)?)?;
             x.broadcast_add(&y)?
         }
         Op::Sub => {
-            let (x, y) = broadcast(tensor(a, 0)?, tensor(a, 1)?)?;
+            let (x, y, _held) = broadcast(budget, tensor(a, 0)?, tensor(a, 1)?)?;
             x.broadcast_sub(&y)?
         }
         Op::Mul => {
-            let (x, y) = broadcast(tensor(a, 0)?, tensor(a, 1)?)?;
+            let (x, y, _held) = broadcast(budget, tensor(a, 0)?, tensor(a, 1)?)?;
             x.broadcast_mul(&y)?
         }
         Op::Div => {
-            let (x, y) = broadcast(tensor(a, 0)?, tensor(a, 1)?)?;
+            let (x, y, _held) = broadcast(budget, tensor(a, 0)?, tensor(a, 1)?)?;
             x.broadcast_div(&y)?
         }
         Op::Pow { exponent } => {
@@ -968,15 +1118,17 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
                 Some(p) => vec![*p],
                 None => e.flatten_all()?.to_vec1::<f32>()?,
             };
-            match scalar[..] {
-                [2.0] => x.sqr()?,
-                [1.0] => x.clone(),
-                [0.5] => x.sqrt()?,
-                [p] => x.powf(f64::from(p))?,
-                _ => {
-                    let (x, e) = broadcast(x, e)?;
-                    x.broadcast_pow(&e)?
+            if let [p] = scalar[..] {
+                let _out = budget.reserve(x.elem_count())?;
+                match p {
+                    2.0 => x.sqr()?,
+                    1.0 => x.clone(),
+                    0.5 => x.sqrt()?,
+                    p => x.powf(f64::from(p))?,
                 }
+            } else {
+                let (x, e, _held) = broadcast(budget, x, e)?;
+                x.broadcast_pow(&e)?
             }
         }
         Op::Pass => match arg(a, 0) {
@@ -988,6 +1140,10 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             if x.rank() != 4 {
                 return Err(msg(format!("GlobalAveragePool takes [N, C, H, W], got {:?}", x.dims())));
             }
+            // each mean is a sum and a scaling: two buffers of the reduced size, the first over the columns, the second
+            // over the rows
+            let (n, c, h) = (x.dim(0)?, x.dim(1)?, x.dim(2)?);
+            let _held = budget.reserve(times(total(&[checked_elements(&[n, c, h])?, checked_elements(&[n, c])?])?, 2)?)?;
             x.mean_keepdim(3)?.mean_keepdim(2)?
         }
         Op::BatchNorm { eps } => {
@@ -999,14 +1155,16 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             if let Some(p) = [scale, bias, mean, var].into_iter().find(|p| p.dims() != [c]) {
                 return Err(msg(format!("BatchNormalization parameters of shape {:?} for {c} channels", p.dims())));
             }
+            // the scaled values and the shifted ones exist together
+            let _held = budget.reserve(times(x.elem_count(), 2)?)?;
             let mul = (scale / (var + *eps)?.sqrt()?)?;
             let add = (bias - mean.mul(&mul)?)?;
             let mut d = vec![1; x.rank()];
             *d.get_mut(1).ok_or_else(|| msg("BatchNormalization needs a channel dimension"))? = mul.elem_count();
             x.broadcast_mul(&mul.reshape(d.clone())?)?.broadcast_add(&add.reshape(d)?)?
         }
-        Op::MaxPool { window: win, ceil } => pool(tensor(a, 0)?, win, *ceil, true)?,
-        Op::AveragePool { window: win, ceil } => pool(tensor(a, 0)?, win, *ceil, false)?,
+        Op::MaxPool { window: win, ceil } => pool(budget, tensor(a, 0)?, win, *ceil, true)?,
+        Op::AveragePool { window: win, ceil } => pool(budget, tensor(a, 0)?, win, *ceil, false)?,
         Op::ReduceMean { axes, keep } => {
             let x = tensor(a, 0)?;
             let rank = x.rank();
@@ -1014,14 +1172,23 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             ax.sort_unstable();
             ax.dedup();
             let mut y = x.clone();
+            // each mean is a sum and a scaling (two buffers of the reduced size), taken while the previous one is alive
+            let mut held = Vec::new();
             for d in ax.iter().rev() {
+                let reduced = y.elem_count() / y.dim(*d)?.max(1);
+                let next = budget.reserve(times(reduced, 2)?)?;
                 y = if *keep { y.mean_keepdim(*d)? } else { y.mean(*d)? };
+                held.clear();
+                held.push(next);
             }
             y
         }
         Op::Softmax { axis: ax, flatten } => {
             let x = tensor(a, 0)?;
             let d = axis(*ax, x.rank())?;
+            // up to three buffers of x's size exist together: a copy made contiguous, the shifted values and the
+            // exponentials of the composed softmax, the result
+            let _held = budget.reserve(times(x.elem_count(), 3)?)?;
             if *flatten && d + 1 != x.rank() {
                 let dims = x.dims().to_vec();
                 let (lo, hi) = dims.split_at_checked(d).ok_or_else(|| msg("axis out of range"))?;
@@ -1038,7 +1205,10 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             if x.rank() < 2 || y.rank() < 2 {
                 return Err(msg("MatMul of vectors is not supported"));
             }
-            check_matmul(x, y)?;
+            // the output, the operands expanded to the batch and the contiguous copies of operands that are not
+            let expected = check_matmul(x, y)?;
+            let copies = [x, y].into_iter().filter(|t| !t.is_contiguous()).map(Tensor::elem_count).sum::<usize>();
+            let _held = budget.reserve(total(&[expected, copies])?)?;
             x.contiguous()?.broadcast_matmul(&y.contiguous()?)?
         }
         Op::Shape => {
@@ -1143,7 +1313,7 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             let rank = ts.first().map_or(0, |t| t.rank());
             // the same value may be named by every input
             let total = ts.iter().try_fold(0usize, |s, t| s.checked_add(t.elem_count())).ok_or_else(|| msg("a concatenation too large"))?;
-            checked_elements(&[total])?;
+            let _out = budget.tensor(&[total])?;
             Tensor::cat(&ts, axis(*ax, rank)?)?
         }
         Op::Resize => {
@@ -1181,10 +1351,11 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             };
             // each side alone too (an input with no elements makes every product 0), and the intermediate, which has the
             // new rows and the old columns
-            checked_elements(&[oh])?;
-            checked_elements(&[ow])?;
-            checked_elements(&[n, c, oh, w])?;
-            checked_elements(&[n, c, oh, ow])?;
+            let (rows, cols) = (checked_elements(&[oh])?, checked_elements(&[ow])?);
+            let (picked, result) = (checked_elements(&[n, c, oh, w])?, checked_elements(&[n, c, oh, ow])?);
+            // the index vectors, the rows picked, the result, and a contiguous copy of the input when it is not
+            let copy = if x.is_contiguous() { 0 } else { x.elem_count() };
+            let _held = budget.reserve(total(&[rows, cols, picked, result, copy])?)?;
             let index = |out: usize, scale: f32, len: usize| -> Result<Tensor> {
                 let v: Vec<u32> = (0..out).map(|i| ((i as f32 / scale).floor().max(0.0) as usize).min(len - 1) as u32).collect();
                 Ok(Tensor::from_vec(v, out, x.device())?)
@@ -1223,6 +1394,8 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
                     *d = t.elem_count() / known;
                 }
             }
+            // a copy made contiguous is the storage of the result
+            let _copy = if t.is_contiguous() { None } else { Some(budget.reserve(t.elem_count())?) };
             t.contiguous()?.reshape(out)?
         }
     };
@@ -1233,7 +1406,7 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
 mod tests {
     use candle_core::{Device, Tensor};
 
-    use super::{Graph, Op, Result, Value, checked_elements, checked_scratch, exec};
+    use super::{Budget, Graph, Op, Result, Value, checked_elements, checked_scratch, exec};
     use crate::onnx::{self, encode::*};
 
     fn graph(bytes: &[u8]) -> Result<Graph> {
@@ -1273,14 +1446,14 @@ mod tests {
             let w: Vec<f32> = (0..4 * k * k).map(|v| ((v * 13 % 17) as f32 - 8.0) / 9.0).collect();
             let w = Tensor::from_vec(w, (4, 1, k, k), &Device::Cpu).unwrap();
             let want = x.conv2d(&w, pad, stride, dil, 4).unwrap();
-            let got = super::depthwise(&x, &w, pad, [stride, stride], dil).unwrap();
+            let got = super::depthwise(&Budget::new(usize::MAX), &x, &w, pad, [stride, stride], dil).unwrap();
             assert_eq!(got.dims(), want.dims(), "k {k} stride {stride}");
             let diff = (got - want).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
             assert!(diff < 1e-4, "k {k} stride {stride} pad {pad} dilation {dil}: {diff}");
         }
         // a window larger than the map is an error, not a panic
         let w = Tensor::ones((4, 1, 3, 3), candle_core::DType::F32, &Device::Cpu).unwrap();
-        assert!(super::depthwise(&x.narrow(2, 0, 2).unwrap(), &w, 0, [1, 1], 1).is_err());
+        assert!(super::depthwise(&Budget::new(usize::MAX), &x.narrow(2, 0, 2).unwrap(), &w, 0, [1, 1], 1).is_err());
     }
 
     #[test]
@@ -1453,7 +1626,7 @@ mod tests {
     fn a_ceil_mode_pool_pad_is_checked() {
         let win = super::Window { kernel: [1, 1], strides: [1 << 20, 1 << 20], dilation: 1, pads: super::Pads::Fixed([0; 4]) };
         let x = Tensor::ones((1, 1, 2, 2), candle_core::DType::F32, &Device::Cpu).unwrap();
-        assert!(super::pool(&x, &win, true, true).is_err());
+        assert!(super::pool(&Budget::new(usize::MAX), &x, &win, true, true).is_err());
     }
 
     /// Shape's start / end (opset 15) would slice the dims; they are not implemented, so they fail at load.
@@ -1538,6 +1711,56 @@ mod tests {
         assert!(g.run_within(&x, 24).is_err());
     }
 
+    /// A padded convolution holds its padded copy of the input, the copy candle lays out for it, the im2col scratch and
+    /// its output at once: 64 (input) + 121 + 121 + 729 + 81 = 1116 elements here. Each alone fits in 900, together they
+    /// do not, so the run is refused before the convolution starts.
+    #[test]
+    fn a_padded_convolution_reserves_its_copies_scratch_and_output_together() {
+        let x = Tensor::ones((1, 1, 8, 8), candle_core::DType::F32, &Device::Cpu).unwrap();
+        // pads (top, left, bottom, right) of (1, 1, 2, 2): not uniform, so the padded copy is made here
+        let g = graph(&conv(&[1, 1, 3, 3], &[attr_ints("pads", &[1, 1, 2, 2])])).unwrap();
+        let e = g.run_within(&x, 900).expect_err("the copies, scratch and output together are over 900").to_string();
+        assert!(e.contains("Conv") && e.contains("900"), "{e}");
+        let (outs, peak) = g.run_within(&x, 1300).unwrap();
+        assert_eq!((outs[0].dims(), peak), (&[1, 1, 9, 9][..], 1116));
+    }
+
+    /// A padded max pool holds the padded copy and its output together: 100 (input) + 120 + 100 = 320 elements here, over
+    /// 300 although the copy (220 with the input) and the output (200) each fit.
+    #[test]
+    fn a_padded_max_pool_reserves_its_padded_copy_and_output_together() {
+        let x = Tensor::ones((1, 1, 10, 10), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let m =
+            model(&[node("MaxPool", &["x"], &["y"], &[attr_ints("kernel_shape", &[1, 3]), attr_ints("pads", &[0, 1, 0, 1])])], &[], &["x"], &["y"]);
+        let g = graph(&m).unwrap();
+        let e = g.run_within(&x, 300).expect_err("the padded copy and the output together are over 300").to_string();
+        assert!(e.contains("MaxPool") && e.contains("300"), "{e}");
+        let (outs, peak) = g.run_within(&x, 400).unwrap();
+        assert_eq!((outs[0].dims(), peak), (&[1, 1, 10, 10][..], 320));
+    }
+
+    /// An operator that is refused partway gives back everything it reserved: the budget holds what the run held before it.
+    #[test]
+    fn a_refused_operator_releases_what_it_reserved() {
+        let x = Value::F(Tensor::ones((1, 1, 8, 8), candle_core::DType::F32, &Device::Cpu).unwrap());
+        let w = Value::F(Tensor::ones((1, 1, 3, 3), candle_core::DType::F32, &Device::Cpu).unwrap());
+        let window = super::Window { kernel: [3, 3], strides: [1, 1], dilation: 1, pads: super::Pads::Fixed([1, 1, 2, 2]) };
+        let op = Op::Conv { window, groups: 1 };
+        // the run holds its input (64); the convolution reserves its padded copy and its output, then is refused at the
+        // next buffer (the input laid out for the product): over 300
+        let budget = Budget::new(300);
+        budget.hold(64).unwrap();
+        let e = exec(&budget, &op, &[Some(&x), Some(&w)]).unwrap_err().to_string();
+        assert!(e.contains("at once") && e.contains("300"), "{e}");
+        assert_eq!(budget.held(), 64);
+        assert!(budget.peak() > 64 + 121, "the padded copy and the output were reserved before the refusal: {}", budget.peak());
+        // the same operator within the limit gives its reservations back too: only the run's own 64 is held
+        let budget = Budget::new(2000);
+        budget.hold(64).unwrap();
+        assert!(exec(&budget, &op, &[Some(&x), Some(&w)]).is_ok());
+        assert_eq!(budget.held(), 64);
+    }
+
     /// BatchNormalization: per-channel parameters that are not one value per channel would broadcast the output to the
     /// parameters' size (a one-channel input with `K` parameters becomes `K` channels).
     #[test]
@@ -1594,8 +1817,9 @@ mod tests {
         assert_eq!(checked_scratch(&[1, 1000, 1000, 256, 3, 3]).unwrap(), 2_304_000_000);
         // the transposed convolution's column buffer of the same kind
         assert!(checked_scratch(&[1, 64, 3, 3, 1000, 1000]).is_ok());
-        // the medium detector's measured peak at 4000 × 4000 (the Conv.121 buffer and what the run holds with it)
-        const { assert!(2_560_000_000 <= super::MAX_LIVE_ELEMENTS) };
+        // the medium detector's measured peak at 4000 × 4000 (the Conv.121 buffer and everything held with it), with the
+        // 1.5 × margin the limit keeps over it
+        const { assert!(2_880_000_000 * 3 / 2 <= super::MAX_LIVE_ELEMENTS) };
         assert!(checked_scratch(&[1, 65_536, 65_536, 16, 3, 3]).is_err());
         assert!(checked_scratch(&[usize::MAX, 2]).is_err());
         // outputs keep the lower ceiling
@@ -1622,9 +1846,9 @@ mod tests {
         assert!(graph(&m).unwrap().run(&x).is_err());
         // a shape vector doubled by Concat, node after node, is bounded too
         let (a, b) = (Value::I(vec![0; 40_000]), Value::I(vec![0; 40_000]));
-        assert!(exec(&Op::Concat { axis: 0 }, &[Some(&a), Some(&b)]).is_err());
+        assert!(exec(&Budget::new(usize::MAX), &Op::Concat { axis: 0 }, &[Some(&a), Some(&b)]).is_err());
         let small = Value::I(vec![1, 2]);
-        assert!(exec(&Op::Concat { axis: 0 }, &[Some(&small), Some(&small)]).is_ok());
+        assert!(exec(&Budget::new(usize::MAX), &Op::Concat { axis: 0 }, &[Some(&small), Some(&small)]).is_ok());
     }
 
     /// Resize: the intermediate (rows picked, columns not yet) is checked as well as the result, and so is an output side
@@ -1634,10 +1858,10 @@ mod tests {
         let x = Tensor::zeros((1, 1, 1, 32768), candle_core::DType::F32, &Device::Cpu).unwrap();
         let x = Value::F(x);
         let sizes = Value::I(vec![1, 1, OVER, 1]);
-        assert!(exec(&Op::Resize, &[Some(&x), None, None, Some(&sizes)]).is_err());
+        assert!(exec(&Budget::new(usize::MAX), &Op::Resize, &[Some(&x), None, None, Some(&sizes)]).is_err());
         let empty = Value::F(Tensor::zeros((0, 1, 1, 1), candle_core::DType::F32, &Device::Cpu).unwrap());
         let sizes = Value::I(vec![0, 1, 1 << 40, 1]);
-        assert!(exec(&Op::Resize, &[Some(&empty), None, None, Some(&sizes)]).is_err());
+        assert!(exec(&Budget::new(usize::MAX), &Op::Resize, &[Some(&empty), None, None, Some(&sizes)]).is_err());
     }
 
     #[test]
