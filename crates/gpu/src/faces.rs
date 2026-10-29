@@ -1,7 +1,7 @@
 //! Face networks on the GPU: an [`lightcraft_faces::net::Accelerator`] that runs the interpreter's convolutions (most of
 //! YuNet's, SFace's and AuraFace's time) with a WGSL kernel (`wgsl/faces_conv.wgsl`). Everything else in the graph
-//! stays on the CPU interpreter, which is the reference: a net attaches this only after it agreed with the CPU on a
-//! test input (`Net::attach_checked`), and drops it on the first error.
+//! stays on the CPU interpreter, which is the reference: a net attaches this only after it agreed with the CPU on every
+//! test input (`Net::attach_checked`; nothing else runs on it until then), and drops it on the first error.
 //!
 //! The device is a separate one (like denoise's), so a face scan and the interactive renders never share a queue, and
 //! it respects the same switches as GPU rendering (`LIGHTCRAFT_GPU`, `LIGHTCRAFT_GPU_BACKEND`, the GPU preference)

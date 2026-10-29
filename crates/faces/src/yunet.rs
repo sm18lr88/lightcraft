@@ -27,8 +27,10 @@ const MAX_CANDIDATES: usize = 5000;
 /// own shape: checked by shape inference at a size scans reach, and by running at small ones.
 const PROBE_SHAPES: [(usize, usize); 5] = [(704, 1024), (1024, 704), (32, 1024), (1024, 32), (32, 32)];
 /// The (height, width) inputs an accelerator is compared with the CPU at when photos keep their shape: what a scan of a
-/// 3:2 landscape and portrait feeds the network, so a height/width mix-up on the device shows.
-const ACCELERATOR_PROBES: [(usize, usize); 2] = [(704, 1024), (1024, 704)];
+/// 3:2 landscape and portrait feeds the network, so a height/width mix-up on the device shows, and the one-row grid a
+/// very wide panorama gives (32 x 1024, a shape the CPU is also run at on load). The device goes live only after it
+/// agreed at every one of them.
+const ACCELERATOR_PROBES: [(usize, usize); 3] = [(704, 1024), (1024, 704), (32, 1024)];
 const PROBE_RUNS: [(usize, usize); 4] = [(96, 160), (160, 96), (32, 32), (32, 192)];
 /// Largest network input side: memory for the stride-8 feature maps grows with its square.
 pub const MAX_INPUT: usize = 4096;
@@ -179,19 +181,16 @@ impl Detector {
     /// runs it faster than the CPU); otherwise
     /// (or on its first error) detection stays on the CPU. Returns why it was not used.
     pub fn accelerate(&self, accelerator: std::sync::Arc<dyn crate::net::Accelerator>, require_faster: bool) -> Result<(), String> {
-        // The shapes detection feeds the network: a landscape and a portrait scan input when photos keep their shape
-        // (the first also decides "faster than the CPU", as a scan runs it), else the declared square.
+        // The shapes detection feeds the network: a landscape, a portrait and a one-row scan input when photos keep
+        // their shape (the first also decides "faster than the CPU", as a scan runs it), else the declared square.
+        // The net publishes the device only after all of them agreed.
         let side = self.side;
         let shapes: &[(usize, usize)] = if self.keeps_photo_shape() { &ACCELERATOR_PROBES } else { &[(side, side)] };
-        for (n, (h, w)) in shapes.iter().enumerate() {
-            let probe = Tensor::new(vec![1, 3, *h, *w], probe_pixels(3 * h * w)).map_err(|e| e.to_string())?;
-            if n == 0 {
-                self.net.attach_checked(accelerator.clone(), &probe, ACCELERATOR_TOLERANCE, require_faster)?;
-            } else {
-                self.net.verify_attached(&probe, ACCELERATOR_TOLERANCE)?;
-            }
-        }
-        Ok(())
+        let probes = shapes
+            .iter()
+            .map(|(h, w)| Tensor::new(vec![1, 3, *h, *w], probe_pixels(3 * h * w)).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.net.attach_checked(accelerator, &probes, ACCELERATOR_TOLERANCE, require_faster)
     }
 
     /// The square input side the model file declares, used to check an installed manifest.
@@ -590,6 +589,37 @@ mod tests {
         assert!(!fixed.keeps_photo_shape());
         fixed.accelerate(std::sync::Arc::new(ShapeBlind), false).unwrap();
         assert!(fixed.net().accelerator().is_some());
+    }
+
+    /// Right (it leaves the layer to the CPU kernels) except where `wrong(h, w)` holds for a layer's input, where it is
+    /// finite but wrong.
+    struct WrongWhen {
+        wrong: fn(usize, usize) -> bool,
+    }
+    impl crate::net::Accelerator for WrongWhen {
+        fn device(&self) -> String {
+            "test".into()
+        }
+        fn conv(&self, j: &crate::net::ConvJob) -> Result<Option<Vec<f32>>, String> {
+            if (self.wrong)(j.h, j.w) { Ok(Some(vec![0.5; j.cout * j.oh * j.ow])) } else { Ok(None) }
+        }
+    }
+
+    #[test]
+    fn each_probe_shape_pins_the_accelerator_check() {
+        let d = Detector::new(&crate::synthetic::tiny_detector_model()).unwrap();
+        assert!(d.keeps_photo_shape());
+        // wrong only on portrait inputs (704 x 1024 is landscape): only the 1024 x 704 probe can catch it
+        let why = d.accelerate(std::sync::Arc::new(WrongWhen { wrong: |h, w| h > w }), false).unwrap_err();
+        assert!(why.contains("differs from the CPU's"), "portrait: {why}");
+        assert!(d.net().accelerator().is_none());
+        // wrong only on the one-row grid of a very wide panorama: only 32 x 1024 reaches it
+        let why = d.accelerate(std::sync::Arc::new(WrongWhen { wrong: |h, w| w >= 32 * h }), false).unwrap_err();
+        assert!(why.contains("differs from the CPU's"), "wide: {why}");
+        assert!(d.net().accelerator().is_none());
+        // right everywhere
+        d.accelerate(std::sync::Arc::new(WrongWhen { wrong: |_, _| false }), false).unwrap();
+        assert!(d.net().accelerator().is_some());
     }
 
     #[test]

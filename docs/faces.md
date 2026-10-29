@@ -156,8 +156,12 @@ needs something the program cannot express runs its convolutions one by one on t
 photo go together (`Embedder::embed_batch`, up to 16 per submission).
 
 The CPU interpreter remains the reference. After a model loads, a background check (a row in the activity stack, "Checking
-the GPU for faces") runs it once on the CPU and twice through the GPU on a fixed test input: the GPU is used only when
-every output is within 1e-3 of the CPU's (relative to the output's largest value) **and** it was faster; until then,
+the GPU for faces") runs it on the CPU and then through the GPU on fixed test inputs (for the detector, the three shapes a scan feeds it:
+1024 x 704 wide, 704 x 1024 high, and the one-row 32 x 1024 grid of a very wide panorama; for a recogniser, its one face
+size): the GPU is used only when every output is within 1e-3 of the CPU's at **every** input (relative to the output's
+largest value) **and** it was faster; the check uses the GPU on its own, so scans keep running on the CPU until the
+last input has agreed and only then switch to it, and choosing **Run face models on the CPU only** while the check runs
+wins over a passing check (the GPU is not used). Until then,
 and whenever the GPU is switched off (`LIGHTCRAFT_GPU=0`, `LIGHTCRAFT_GPU_BACKEND=off`, the GPU preference, or **Settings ▸
 Faces ▸ Run face models on the CPU only**), missing, wrong or slower, the model runs on the CPU. The first GPU error,
 or a result of the wrong size or with values that are not finite, drops it for that model. Settings ▸ Faces shows
