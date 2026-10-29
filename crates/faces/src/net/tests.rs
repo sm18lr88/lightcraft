@@ -268,13 +268,152 @@ fn a_failing_accelerator_falls_back_to_the_cpu_mid_run() {
     let (g, x) = two_convs();
     let net = Net::new(g).unwrap();
     let cpu = net.run(x.clone()).unwrap();
-    // agrees on the probe (two convs), then fails on the second conv of the next run
-    net.attach_checked(Arc::new(Fake { skew: 0.0, fail_after: 3.into() }), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    // agrees on the probe (two convs), then fails on the first conv of the next run, so the second is left to the CPU
+    // (`a_device_that_failed_is_not_asked_again_in_the_run` counts the calls it must not get)
+    net.attach_checked(Arc::new(Fake { skew: 0.0, fail_after: 2.into() }), std::slice::from_ref(&x), 1e-4, false).unwrap();
     let out = net.run(x).unwrap();
     assert!(net.accelerator().is_none());
     for (a, b) in out[0].1.data.iter().zip(&cpu[0].1.data) {
         assert!((a - b).abs() < 1e-4);
     }
+}
+
+/// A device that works until told to misbehave (`fail_from_now`), then fails every convolution it is given (or, with
+/// `nan`, answers with values that are not finite), counting the calls made after the first bad one.
+struct Counting {
+    calls: std::sync::atomic::AtomicUsize,
+    bad_from: std::sync::atomic::AtomicUsize,
+    after_failure: std::sync::atomic::AtomicUsize,
+    nan: bool,
+}
+impl Counting {
+    fn new(nan: bool) -> Arc<Counting> {
+        Arc::new(Counting { calls: 0.into(), bad_from: usize::MAX.into(), after_failure: 0.into(), nan })
+    }
+    fn fail_from_now(&self) {
+        self.bad_from.store(self.calls.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
+    }
+    fn calls_after_the_first_bad_one(&self) -> usize {
+        self.after_failure.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl Accelerator for Counting {
+    fn device(&self) -> String {
+        "counting".into()
+    }
+    fn conv(&self, j: &ConvJob) -> std::result::Result<Option<Vec<f32>>, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let n = self.calls.fetch_add(1, SeqCst);
+        let bad_from = self.bad_from.load(SeqCst);
+        if n > bad_from {
+            self.after_failure.fetch_add(1, SeqCst);
+        }
+        if n >= bad_from {
+            return if self.nan { Ok(Some(vec![f32::NAN; j.cout * j.oh * j.ow])) } else { Err("device lost".into()) };
+        }
+        let x = Tensor::new(vec![1, j.cin, j.h, j.w], j.input.to_vec()).unwrap();
+        let zero = vec![0.0; j.cout];
+        let dims = [j.cout, j.cin / j.groups, j.kh, j.kw];
+        Ok(Some(reference_conv(&x, j.weights, dims, j.bias.unwrap_or(&zero), j.sh, j.pt, j.groups).data))
+    }
+}
+
+fn two_convs_inputs(n: usize) -> Vec<Tensor> {
+    (0..n).map(|s| input(3, 9, 8, |i| (((i * 13 + s * 5) % 17) as f32 - 8.0) * 0.1)).collect()
+}
+
+#[test]
+fn a_device_that_failed_is_not_asked_again_in_the_run() {
+    let (g, x) = two_convs();
+    let net = Net::new(g).unwrap();
+    let cpu = net.run(x.clone()).unwrap();
+    let device = Counting::new(false);
+    net.attach_checked(device.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    // it fails on the first of the two convolutions: the second must not go to it
+    device.fail_from_now();
+    let out = net.run(x).unwrap();
+    assert_eq!(device.calls_after_the_first_bad_one(), 0);
+    assert!(net.accelerator().is_none());
+    agree(&cpu, &out, 1e-4).unwrap();
+}
+
+#[test]
+fn a_device_that_failed_on_the_first_input_is_not_asked_for_the_rest_of_the_batch() {
+    let (g, x) = two_convs();
+    let net = Net::new(g).unwrap();
+    let inputs = two_convs_inputs(3);
+    let cpu: Vec<_> = inputs.iter().map(|t| net.run(t.clone()).unwrap()).collect();
+    let device = Counting::new(false);
+    net.attach_checked(device.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    device.fail_from_now();
+    let out = net.run_batch(inputs).unwrap();
+    assert_eq!(device.calls_after_the_first_bad_one(), 0);
+    for (want, got) in cpu.iter().zip(&out) {
+        agree(want, got, 1e-4).unwrap();
+    }
+}
+
+#[test]
+fn a_failing_device_detaches_the_net_once() {
+    let (g, x) = two_convs();
+    let net = Net::new(g).unwrap();
+    let device = Counting::new(false);
+    net.attach_checked(device.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    assert_eq!(net.detaches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    device.fail_from_now();
+    net.run_batch(two_convs_inputs(2)).unwrap();
+    assert_eq!(net.detaches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_device_that_answers_with_values_that_are_not_finite_mid_run_gives_the_cpu_result() {
+    let (g, x) = two_convs();
+    let net = Net::new(g).unwrap();
+    let cpu = net.run(x.clone()).unwrap();
+    let device = Counting::new(true);
+    net.attach_checked(device.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    device.fail_from_now();
+    let out = net.run(x).unwrap();
+    assert_eq!(device.calls_after_the_first_bad_one(), 0);
+    assert!(net.accelerator().is_none());
+    agree(&cpu, &out, 1e-4).unwrap();
+}
+
+/// Runs whole programs correctly until `poison` is set, then answers with a value that is not finite; any single
+/// convolution it is given is answered with values that are not finite too, and counted.
+struct LateNaN {
+    poison: std::sync::atomic::AtomicBool,
+    conv_calls: std::sync::atomic::AtomicUsize,
+}
+impl Accelerator for LateNaN {
+    fn device(&self) -> String {
+        "late nan".into()
+    }
+    fn conv(&self, j: &ConvJob) -> std::result::Result<Option<Vec<f32>>, String> {
+        self.conv_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(vec![f32::NAN; j.cout * j.oh * j.ow]))
+    }
+    fn run_program(&self, p: &program::Program, inputs: &[&[f32]]) -> std::result::Result<Option<Vec<Vec<Vec<f32>>>>, String> {
+        let mut out: Vec<Vec<Vec<f32>>> = inputs.iter().map(|x| run_steps(p, x)).collect();
+        if self.poison.load(std::sync::atomic::Ordering::SeqCst) {
+            out[0][0][0] = f32::NAN;
+        }
+        Ok(Some(out))
+    }
+}
+
+#[test]
+fn a_program_answer_that_is_not_finite_falls_back_to_the_cpu_without_asking_the_device_again() {
+    let net = Net::new(crate::synthetic::every_operator_graph()).unwrap();
+    let x = every_operator_input(2);
+    let cpu = net.run(x.clone()).unwrap();
+    let device = Arc::new(LateNaN { poison: false.into(), conv_calls: 0.into() });
+    net.attach_checked(device.clone(), std::slice::from_ref(&x), 1e-5, false).unwrap();
+    device.poison.store(true, std::sync::atomic::Ordering::SeqCst);
+    let out = net.run(x).unwrap();
+    assert_eq!(device.conv_calls.load(std::sync::atomic::Ordering::SeqCst), 0, "the convolutions of the CPU fallback went to the device");
+    assert!(net.accelerator().is_none());
+    assert_eq!(out, cpu);
 }
 
 /// An accelerator that runs whole programs with plain loops (the definition of each step), counting its calls;

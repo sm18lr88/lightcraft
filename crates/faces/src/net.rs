@@ -145,10 +145,17 @@ impl Lane {
         Lane { device, published, failed: AtomicBool::new(false) }
     }
 
-    /// The device failed: stop using it, and drop it from the net when it is the net's.
+    /// The device this lane may call: none once it has failed, so nothing on the lane (the rest of the run, the other
+    /// inputs of a batch, the CPU fallback) asks it again. Every reader of the device goes through here.
+    fn device(&self) -> Option<&Arc<dyn Accelerator>> {
+        self.device.as_ref().filter(|_| !self.has_failed())
+    }
+
+    /// The device failed: stop using it, and drop it from the net when it is the net's (once, however many calls
+    /// report the failure).
     fn fail(&self, net: &Net) {
-        self.failed.store(true, Ordering::SeqCst);
-        if self.published {
+        let first = !self.failed.swap(true, Ordering::SeqCst);
+        if first && self.published {
             net.detach();
         }
     }
@@ -274,12 +281,15 @@ impl Net {
         self.run_batch_in(lane, vec![input])?.pop().ok_or_else(|| NetError::Shape("the run gave nothing".into()))
     }
 
-    /// A convolution on the accelerator, if one is attached and takes it. A failing accelerator is dropped.
+    /// A convolution on the accelerator, if one is attached and takes it. A failing accelerator (an error, or an answer of
+    /// the wrong size or with values that are not finite) is dropped, and the lane runs on the CPU from then on.
     fn accelerated_conv(&self, lane: &Lane, layer: usize, node: &Node, x: &Tensor) -> Result<Option<Tensor>> {
-        let Some(accelerator) = lane.device.as_ref() else { return Ok(None) };
+        let Some(accelerator) = lane.device() else { return Ok(None) };
         let job = kernels::conv_job(layer, node, &x.shape, &x.data, &self.graph)?;
         match accelerator.conv(&job) {
-            Ok(Some(out)) if out.len() == job.cout * job.oh * job.ow => Ok(Some(Tensor::new(vec![1, job.cout, job.oh, job.ow], out)?)),
+            Ok(Some(out)) if out.len() == job.cout * job.oh * job.ow && out.iter().all(|v| v.is_finite()) => {
+                Ok(Some(Tensor::new(vec![1, job.cout, job.oh, job.ow], out)?))
+            }
             Ok(None) => Ok(None),
             Ok(Some(_)) | Err(_) => {
                 lane.fail(self);
@@ -323,7 +333,7 @@ impl Net {
     /// The whole batch on the attached accelerator, or `None` to run it on the CPU path. A failing or misbehaving
     /// accelerator is dropped.
     fn run_on_device(&self, lane: &Lane, inputs: &[Tensor]) -> Result<Option<Vec<Vec<(String, Tensor)>>>> {
-        let (Some(accelerator), Some(first)) = (lane.device.as_ref(), inputs.first()) else { return Ok(None) };
+        let (Some(accelerator), Some(first)) = (lane.device(), inputs.first()) else { return Ok(None) };
         if inputs.iter().any(|t| t.shape != first.shape) {
             return Ok(None);
         }

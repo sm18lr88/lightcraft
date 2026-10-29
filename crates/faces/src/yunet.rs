@@ -26,10 +26,11 @@ const MAX_CANDIDATES: usize = 5000;
 /// The non-square shapes (height, width) a model must run at, besides its declared square, to be fed photos in their
 /// own shape: checked by shape inference at a size scans reach, and by running at small ones.
 const PROBE_SHAPES: [(usize, usize); 5] = [(704, 1024), (1024, 704), (32, 1024), (1024, 32), (32, 32)];
-/// The (height, width) inputs an accelerator is compared with the CPU at when photos keep their shape: what a scan of a
-/// 3:2 landscape and portrait feeds the network, so a height/width mix-up on the device shows, and the one-row grid a
-/// very wide panorama gives (32 x 1024, a shape the CPU is also run at on load). The device goes live only after it
-/// agreed at every one of them.
+/// The (height, width) inputs an accelerator is compared with the CPU at when photos keep their shape: a 3:2
+/// landscape (1024 wide, 704 high) and portrait, so a height/width mix-up on the device shows, and a one-row grid for
+/// a panorama (1024 wide, 32 high, a shape the CPU is also run at on load). They are representative shapes, not every
+/// shape a scan runs: a scan's shapes come from each photo. The device goes live only after it agreed at every one
+/// of them.
 const ACCELERATOR_PROBES: [(usize, usize); 3] = [(704, 1024), (1024, 704), (32, 1024)];
 const PROBE_RUNS: [(usize, usize); 4] = [(96, 160), (160, 96), (32, 32), (32, 192)];
 /// Largest network input side: memory for the stride-8 feature maps grows with its square.
@@ -613,7 +614,7 @@ mod tests {
         let why = d.accelerate(std::sync::Arc::new(WrongWhen { wrong: |h, w| h > w }), false).unwrap_err();
         assert!(why.contains("differs from the CPU's"), "portrait: {why}");
         assert!(d.net().accelerator().is_none());
-        // wrong only on the one-row grid of a very wide panorama: only 32 x 1024 reaches it
+        // wrong only on the one-row grid of a panorama (1024 wide, 32 high): only that probe reaches it
         let why = d.accelerate(std::sync::Arc::new(WrongWhen { wrong: |h, w| w >= 32 * h }), false).unwrap_err();
         assert!(why.contains("differs from the CPU's"), "wide: {why}");
         assert!(d.net().accelerator().is_none());

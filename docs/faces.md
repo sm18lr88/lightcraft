@@ -156,15 +156,16 @@ needs something the program cannot express runs its convolutions one by one on t
 photo go together (`Embedder::embed_batch`, up to 16 per submission).
 
 The CPU interpreter remains the reference. After a model loads, a background check (a row in the activity stack, "Checking
-the GPU for faces") runs it on the CPU and then through the GPU on fixed test inputs (for the detector, the three shapes a scan feeds it:
-1024 x 704 wide, 704 x 1024 high, and the one-row 32 x 1024 grid of a very wide panorama; for a recogniser, its one face
-size): the GPU is used only when every output is within 1e-3 of the CPU's at **every** input (relative to the output's
+the GPU for faces") runs it on the CPU and then through the GPU on fixed test inputs (sizes are width x height here; for the detector, three representative shapes, not every shape a
+scan runs, since a scan's shape comes from each photo: 1024 x 704 landscape, 704 x 1024 portrait, and 1024 x 32, a one-row
+grid like a panorama gives; for a recogniser, its one face size): the GPU is used only when every output is within 1e-3 of the CPU's at **every** input (relative to the output's
 largest value) **and** it was faster; the check uses the GPU on its own, so scans keep running on the CPU until the
 last input has agreed and only then switch to it, and choosing **Run face models on the CPU only** while the check runs
 wins over a passing check (the GPU is not used). Until then,
 and whenever the GPU is switched off (`LIGHTCRAFT_GPU=0`, `LIGHTCRAFT_GPU_BACKEND=off`, the GPU preference, or **Settings ▸
 Faces ▸ Run face models on the CPU only**), missing, wrong or slower, the model runs on the CPU. The first GPU error,
-or a result of the wrong size or with values that are not finite, drops it for that model. Settings ▸ Faces shows
+or a result of the wrong size or with values that are not finite, drops it for that model, and nothing in that run
+calls it again (the rest of the run, the other photos or faces in the same batch, and the CPU fallback all use the CPU). Settings ▸ Faces shows
 which device each model runs on (`faces.gpu`). The weights stay on a device of the scan's own (separate from the
 editor's) while the model is loaded, at most 768 MB per model.
 
