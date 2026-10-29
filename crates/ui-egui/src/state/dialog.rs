@@ -175,11 +175,12 @@ pub enum Dialog {
         similarity: f32,
     },
     /// Photo ▸ Find Duplicates: the level chosen (`near`: also the same picture saved again), the last
-    /// `library.findDuplicates` answer, and the photos ticked to keep.
+    /// `library.findDuplicates` answer (shared, so the dialog's copy each frame does not copy a big library's groups),
+    /// and the photos ticked to keep.
     Duplicates {
         near: bool,
         #[serde(default)]
-        result: Option<serde_json::Value>,
+        result: Option<std::sync::Arc<serde_json::Value>>,
         #[serde(default)]
         keep: Vec<u64>,
     },

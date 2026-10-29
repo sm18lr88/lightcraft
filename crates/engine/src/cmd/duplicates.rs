@@ -35,7 +35,8 @@ fn usable(p: &Photo) -> bool {
     p.in_library() && p.copy_of.is_none() && p.duration.is_none()
 }
 
-/// What byte-identical files share: their content hash (a demo photo, which has no file, its scene).
+/// What byte-identical files share: their content hash (a demo photo, which has no file, its scene). A copy made with
+/// Photo ▸ Duplicate keeps its own `<hash>:dup<id>` and so is not grouped with its original: the user made it on purpose.
 fn exact_key(p: &Photo) -> Option<String> {
     match (&p.content_hash, &p.source) {
         (Some(h), _) => Some(h.clone()),
@@ -230,7 +231,7 @@ impl Scan {
         if !self.near {
             return true;
         }
-        let deadline = budget.and_then(|b| std::time::Instant::now().checked_add(b));
+        let deadline = budget.and_then(|b| web_time::Instant::now().checked_add(b));
         loop {
             if self.next < self.units.len() {
                 self.read_signature(s);
@@ -238,7 +239,7 @@ impl Scan {
             } else if self.join_step() {
                 return true;
             }
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if deadline.is_some_and(|d| web_time::Instant::now() >= d) {
                 return false;
             }
         }

@@ -95,18 +95,18 @@ pub fn drop_if_closed(app: &mut LightcraftApp) {
 }
 
 /// Mark group `g`'s photos not ticked Rejected, and take the group out of the list.
-fn resolve(app: &mut LightcraftApp, g: usize, result: &mut Option<Value>, keep: &[u64]) -> Result<(), String> {
+fn resolve(app: &mut LightcraftApp, g: usize, result: &mut Option<Arc<Value>>, keep: &[u64]) -> Result<(), String> {
     let group = result.as_ref().and_then(|r| r["groups"].get(g)).cloned().ok_or("that group is gone")?;
     let ids = ids_of(&group, "id");
     let kept: Vec<u64> = ids.iter().copied().filter(|id| keep.contains(id)).collect();
     app.run("library.resolveDuplicates", json!({"ids": ids, "keep": kept}))?;
-    if let Some(groups) = result.as_mut().and_then(|r| r["groups"].as_array_mut()) {
+    if let Some(groups) = result.as_mut().and_then(|r| Arc::make_mut(r)["groups"].as_array_mut()) {
         groups.remove(g);
     }
     Ok(())
 }
 
-pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, near: &mut bool, result: &mut Option<Value>, keep: &mut Vec<u64>) {
+pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, near: &mut bool, result: &mut Option<Arc<Value>>, keep: &mut Vec<u64>) {
     let tr = crate::i18n::tr;
     // never wider than the window, however many photos a group has: its rows wrap inside this width
     ui.set_max_width((ui.ctx().content_rect().width() - 120.0).clamp(300.0, 1060.0));
@@ -128,7 +128,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, near: &mut b
     ui.add_space(6.0);
     if let Some(found) = pump(app, ui.ctx()) {
         *keep = found["groups"].as_array().into_iter().flatten().filter_map(|g| g["keep"].as_u64()).collect();
-        *result = Some(found);
+        *result = Some(Arc::new(found));
     }
     let running = app.duplicates_run.is_some();
     ui.horizontal(|ui| {

@@ -47,6 +47,12 @@ fn the_dialog_keeps_the_suggested_copy_and_rejects_the_other() {
     assert_eq!(groups.len(), 1, "{found}");
     assert_eq!(groups[0]["keep"], original.0, "the bigger copy is suggested");
     assert!(keep.contains(&original.0) && !keep.contains(&copy_id.0), "the suggested photo is ticked: {keep:?}");
+    let shown = std::sync::Arc::clone(found);
+    h.step();
+    h.step();
+    let Some(Dialog::Duplicates { result: Some(now), .. }) = &h.app.ui.dialog else { panic!("the dialog stays open") };
+    assert!(std::sync::Arc::ptr_eq(&shown, now), "redrawing the dialog shares its groups instead of copying them");
+    drop(shown);
 
     click(&mut h, "button:duplicates.resolve.0");
     assert_eq!(h.app.session.catalog.photo(copy_id).unwrap().flag, Flag::Reject);
