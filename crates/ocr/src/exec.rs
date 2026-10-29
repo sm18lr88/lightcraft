@@ -6,7 +6,8 @@
 //! Pow, Sqrt), ReduceMean, Softmax, MatMul, pooling, nearest Resize, the layout operators (Transpose, Reshape, Squeeze,
 //! Unsqueeze, Concat, Slice) and the shape arithmetic (Shape, Gather, Slice and Concat on int64 vectors) that feeds
 //! Reshape its sizes; Constant nodes become constants at load. Unsupported operators, attributes and dangling value
-//! names fail at load, not in the middle of a run.
+//! names fail at load, not in the middle of a run. Every operator that allocates a size the model file controls (see
+//! `MAX_RUNTIME_ELEMENTS`) checks it before candle does, so a hostile model is an error and never an out-of-memory abort.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -16,8 +17,31 @@ use candle_core::{Device, Tensor};
 use crate::onnx::{self, Attr, Data, ModelProto, NodeProto, TensorProto};
 use crate::{Error, Result};
 
-/// Largest tensor a shape computed at run time may ask for, in elements (1 GB of f32).
-const MAX_RUNTIME_ELEMENTS: usize = 1 << 28;
+/// Largest tensor any operator may produce at run time, in elements (2^30, 4 GiB of f32): its output and the copies it
+/// makes of an operand on the way (a padded copy, a stride-1 intermediate, a broadcast operand). Every operator checks
+/// the sizes it is about to ask candle for with [`checked_elements`] before asking, because those sizes come from the
+/// model file (weights, constants, shape arithmetic) and not from the input image. Operators whose output is no larger
+/// than an input are exempt.
+///
+/// Why this number: the reader feeds the detector up to 4000 × 4000 pixels, and the largest feature map the shipped
+/// models (PP-OCRv6 tiny, small, medium) build there is the medium detector's first padded convolution input,
+/// 128 × 2001 × 2001 = 512 million elements. 2^30 is 2.1 times that, so every shipped model passes with room to spare
+/// at the largest photo, and a model that asks for more (two tiny initializers broadcast to 16 GB) is an error.
+const MAX_RUNTIME_ELEMENTS: usize = 1 << 30;
+/// Largest scratch buffer a convolution may build, in elements (2^32, 16 GiB of f32): the im2col buffer of a convolution
+/// (one row of `c_in · kh · kw` taps per output position) and the column buffer of a transposed convolution. Scratch is
+/// much larger than the output it makes (it holds `c_in · kh · kw` values per output position, where the output holds
+/// `c_out`), so it has its own, higher ceiling than [`MAX_RUNTIME_ELEMENTS`].
+///
+/// Why this number: at the same 4000 × 4000 photo the medium detector's widest 3 × 3 convolution (Conv.121, 256 channels
+/// in, 1000 × 1000 out) builds 1 × 1000 × 1000 × 256 × 3 × 3 = 2.304 billion elements; 2^32 is 1.86 times that. (A
+/// 1600 × 1216 photo needs 280 million of them.) The tiny and
+/// small sets, the recogniser (6 lines of 48 × 3200) and the orientation classifier (32 lines of 80 × 160) all need less.
+/// A model that asks for more is an error, not an out-of-memory abort.
+const MAX_SCRATCH_ELEMENTS: usize = 1 << 32;
+/// Longest int64 vector (a shape, in practice a handful of values) Concat may build: the same vector can be named by
+/// every input and fed back through node after node.
+const MAX_SHAPE_LEN: usize = 1 << 16;
 /// Largest dilation and padding a window may have (PP-OCR's use a dilation of 1 and pads of a few pixels): a model file
 /// asking for more is refused at load, before any arithmetic on it.
 const MAX_DILATION: usize = 64;
@@ -564,9 +588,50 @@ fn lift(t: &Tensor, r: usize) -> Result<Tensor> {
     Ok(t.reshape(d)?)
 }
 
+/// Both operands lifted to a common rank; the broadcast result (the per-axis maximum) is checked against the limit.
 fn broadcast(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
     let r = a.rank().max(b.rank());
-    Ok((lift(a, r)?, lift(b, r)?))
+    let (a, b) = (lift(a, r)?, lift(b, r)?);
+    let out: Vec<usize> = a.dims().iter().zip(b.dims()).map(|(x, y)| *x.max(y)).collect();
+    checked_elements(&out)?;
+    Ok((a, b))
+}
+
+/// The output of a matrix product (batch dimensions broadcast, then `[m, n]`) and the two operands candle expands to it,
+/// checked against the limit.
+fn check_matmul(x: &Tensor, y: &Tensor) -> Result<()> {
+    let (Some((bx, mk)), Some((by, kn))) =
+        (x.dims().split_at_checked(x.rank().saturating_sub(2)), y.dims().split_at_checked(y.rank().saturating_sub(2)))
+    else {
+        return Err(msg("MatMul of vectors is not supported"));
+    };
+    let (&[m, k], &[k2, n]) = (mk, kn) else { return Err(msg("MatMul of vectors is not supported")) };
+    if k != k2 {
+        return Err(msg(format!("can't multiply {:?} by {:?}", x.dims(), y.dims())));
+    }
+    let nb = bx.len().max(by.len());
+    // batch dimensions align on the right, missing ones are 1
+    let side = |b: &[usize], i: usize| (i + b.len()).checked_sub(nb).and_then(|j| b.get(j)).copied().unwrap_or(1);
+    let batch: Vec<usize> = (0..nb).map(|i| side(bx, i).max(side(by, i))).collect();
+    for rest in [[m, n], [m, k], [k, n]] {
+        let mut dims = batch.clone();
+        dims.extend(rest);
+        checked_elements(&dims)?;
+    }
+    Ok(())
+}
+
+/// `y` plus a per-channel bias. A bias that is not one value per channel would broadcast the output larger.
+fn add_bias(y: Tensor, a: &[Option<&Value>]) -> Result<Tensor> {
+    if arg(a, 2).is_none() {
+        return Ok(y);
+    }
+    let bias = tensor(a, 2)?;
+    let c = y.dim(1)?;
+    if bias.elem_count() != c {
+        return Err(msg(format!("a bias of {} values for {c} channels", bias.elem_count())));
+    }
+    Ok(y.broadcast_add(&bias.reshape((1, c, 1, 1))?)?)
 }
 
 /// `axis` (negative counts from the end) as an index into `rank` dims.
@@ -596,10 +661,16 @@ fn conv_safe_layout(x: &Tensor) -> Result<Tensor> {
 }
 
 fn checked_elements(dims: &[usize]) -> Result<usize> {
-    dims.iter()
-        .try_fold(1usize, |a, d| a.checked_mul(*d))
-        .filter(|n| *n <= MAX_RUNTIME_ELEMENTS)
-        .ok_or_else(|| msg(format!("a tensor of {dims:?} is too large")))
+    checked_within(dims, MAX_RUNTIME_ELEMENTS)
+}
+
+/// [`checked_elements`] for a scratch buffer (an im2col or column buffer), against [`MAX_SCRATCH_ELEMENTS`].
+fn checked_scratch(dims: &[usize]) -> Result<usize> {
+    checked_within(dims, MAX_SCRATCH_ELEMENTS)
+}
+
+fn checked_within(dims: &[usize], limit: usize) -> Result<usize> {
+    dims.iter().try_fold(1usize, |a, d| a.checked_mul(*d)).filter(|n| *n <= limit).ok_or_else(|| msg(format!("a tensor of {dims:?} is too large")))
 }
 
 /// Every `step`-th index of `dim` from 0 (a stride candle's ops can't take directly).
@@ -715,9 +786,19 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             checked_elements(&[batch, chans, ph, pw])?;
             let (x, p) = if t == l && l == b && b == r { (x.clone(), t) } else { (x.pad_with_zeros(2, t, b)?.pad_with_zeros(3, l, r)?, 0) };
             let [sh, sw] = win.strides;
-            let y = if *groups > 1 && c_in_k == 1 && c_out == *groups && x.dim(1)? == *groups {
+            let depthwise_path = *groups > 1 && c_in_k == 1 && c_out == *groups && chans == *groups;
+            let pointwise_path = *groups == 1 && (kh, kw, sh, sw, p) == (1, 1, 1, 1, 0);
+            // the output has the weights' channels, so it can be far larger than the input; unequal strides first build
+            // the stride-1 output; the general path builds an im2col buffer of one kernel's taps per output position
+            let (oh, ow) = (ph.saturating_sub(eh) / sh + 1, pw.saturating_sub(ew) / sw + 1);
+            let (ah, aw) = if sh == sw || depthwise_path { (oh, ow) } else { (ph.saturating_sub(eh) + 1, pw.saturating_sub(ew) + 1) };
+            checked_elements(&[batch, c_out, ah, aw])?;
+            if !depthwise_path && !pointwise_path {
+                checked_scratch(&[batch, ah, aw, c_in_k, kh, kw])?;
+            }
+            let y = if depthwise_path {
                 depthwise(&x, w, p, [sh, sw], win.dilation)?
-            } else if *groups == 1 && (kh, kw, sh, sw, p) == (1, 1, 1, 1, 0) {
+            } else if pointwise_path {
                 // a pointwise convolution is one matrix product ([c_out, c_in] × [c_in, h·w] per image), not im2col
                 let (n, c, h, wd) = x.dims4()?;
                 let y = w.reshape((c_out, c))?.broadcast_matmul(&x.reshape((n, c, h * wd))?)?;
@@ -731,24 +812,22 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
                 let y = every(&y, 2, sh, (yh - 1) / sh + 1)?;
                 every(&y, 3, sw, (yw - 1) / sw + 1)?
             };
-            match arg(a, 2) {
-                Some(_) => {
-                    let bias = tensor(a, 2)?;
-                    y.broadcast_add(&bias.reshape((1, bias.elem_count(), 1, 1))?)?
-                }
-                None => y,
-            }
+            add_bias(y, a)?
         }
         Op::ConvTranspose { stride } => {
             let (x, w) = (tensor(a, 0)?, tensor(a, 1)?);
-            let y = x.contiguous()?.conv_transpose2d(&w.contiguous()?, 0, 0, *stride, 1)?;
-            match arg(a, 2) {
-                Some(_) => {
-                    let bias = tensor(a, 2)?;
-                    y.broadcast_add(&bias.reshape((1, bias.elem_count(), 1, 1))?)?
-                }
-                None => y,
+            let (n, c_in, h, wd) = x.dims4()?;
+            let (w_in, c_out, kh, kw) = w.dims4()?;
+            if w_in != c_in {
+                return Err(msg(format!("{c_in} input channels for weights of {:?}", w.dims())));
             }
+            // the output grows with the stride and the weights' kernel; candle also builds a [c_out·kh·kw, h·w] product
+            let grown = |len: usize, k: usize| {
+                len.saturating_sub(1).checked_mul(*stride).and_then(|v| v.checked_add(k)).ok_or_else(|| msg("a transposed convolution too large"))
+            };
+            checked_elements(&[n, c_out, grown(h, kh)?, grown(wd, kw)?])?;
+            checked_scratch(&[n, c_out, kh, kw, h, wd])?;
+            add_bias(x.contiguous()?.conv_transpose2d(&w.contiguous()?, 0, 0, *stride, 1)?, a)?
         }
         Op::Relu => tensor(a, 0)?.relu()?,
         Op::Sigmoid => candle_nn::ops::sigmoid(tensor(a, 0)?)?,
@@ -804,6 +883,12 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
         Op::BatchNorm { eps } => {
             let x = tensor(a, 0)?;
             let (scale, bias, mean, var) = (tensor(a, 1)?, tensor(a, 2)?, tensor(a, 3)?, tensor(a, 4)?);
+            // one value per channel, as a vector: any other shape would broadcast the output (or the arithmetic on the
+            // parameters) to the parameters' size
+            let c = *x.dims().get(1).ok_or_else(|| msg("BatchNormalization needs a channel dimension"))?;
+            if let Some(p) = [scale, bias, mean, var].into_iter().find(|p| p.dims() != [c]) {
+                return Err(msg(format!("BatchNormalization parameters of shape {:?} for {c} channels", p.dims())));
+            }
             let mul = (scale / (var + *eps)?.sqrt()?)?;
             let add = (bias - mean.mul(&mul)?)?;
             let mut d = vec![1; x.rank()];
@@ -843,6 +928,7 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             if x.rank() < 2 || y.rank() < 2 {
                 return Err(msg("MatMul of vectors is not supported"));
             }
+            check_matmul(x, y)?;
             x.contiguous()?.broadcast_matmul(&y.contiguous()?)?
         }
         Op::Shape => {
@@ -935,12 +1021,19 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
             if a.iter().all(|v| matches!(v, Some(Value::I(_)))) {
                 let mut out = Vec::new();
                 for i in 0..a.len() {
-                    out.extend_from_slice(ints(a, i)?);
+                    let part = ints(a, i)?;
+                    if out.len().saturating_add(part.len()) > MAX_SHAPE_LEN {
+                        return Err(msg(format!("a concatenated vector of more than {MAX_SHAPE_LEN} values is too large")));
+                    }
+                    out.extend_from_slice(part);
                 }
                 return Ok(Value::I(out));
             }
             let ts = (0..a.len()).map(|i| tensor(a, i)).collect::<Result<Vec<_>>>()?;
             let rank = ts.first().map_or(0, |t| t.rank());
+            // the same value may be named by every input
+            let total = ts.iter().try_fold(0usize, |s, t| s.checked_add(t.elem_count())).ok_or_else(|| msg("a concatenation too large"))?;
+            checked_elements(&[total])?;
             Tensor::cat(&ts, axis(*ax, rank)?)?
         }
         Op::Resize => {
@@ -976,6 +1069,11 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
                     (oh as usize, ow as usize, sh, sw)
                 }
             };
+            // each side alone too (an input with no elements makes every product 0), and the intermediate, which has the
+            // new rows and the old columns
+            checked_elements(&[oh])?;
+            checked_elements(&[ow])?;
+            checked_elements(&[n, c, oh, w])?;
             checked_elements(&[n, c, oh, ow])?;
             let index = |out: usize, scale: f32, len: usize| -> Result<Tensor> {
                 let v: Vec<u32> = (0..out).map(|i| ((i as f32 / scale).floor().max(0.0) as usize).min(len - 1) as u32).collect();
@@ -1025,7 +1123,7 @@ fn exec(op: &Op, a: &[Option<&Value>]) -> Result<Value> {
 mod tests {
     use candle_core::{Device, Tensor};
 
-    use super::{Graph, Result};
+    use super::{Graph, Op, Result, Value, checked_elements, checked_scratch, exec};
     use crate::onnx::{self, encode::*};
 
     fn graph(bytes: &[u8]) -> Result<Graph> {
@@ -1257,6 +1355,142 @@ mod tests {
         }
         let m = model(&[node("Shape", &["x"], &["s"], &[])], &[], &["x"], &["s"]);
         assert!(graph(&m).is_ok());
+    }
+
+    /// A model-sized initializer: `n` ones.
+    fn ones(name: &str, dims: &[i64]) -> Vec<u8> {
+        let n = dims.iter().product::<i64>().max(0) as usize;
+        tensor_f32(name, dims, &vec![1.0; n])
+    }
+
+    /// Just above `MAX_RUNTIME_ELEMENTS` squared-root (2^15), so a product of two of them is over the limit.
+    const OVER: i64 = 32769;
+
+    /// Broadcasting arithmetic: two small initializers whose per-axis maximum is over the limit are an error, not a
+    /// gigabyte-scale allocation (at [65536, 1] and [1, 65536] it is 16 GB and candle aborts the process).
+    #[test]
+    fn a_broadcast_output_over_the_limit_is_an_error() {
+        let x = Tensor::zeros((1, 1), candle_core::DType::F32, &Device::Cpu).unwrap();
+        for op in ["Add", "Sub", "Mul", "Div", "Pow"] {
+            let m = model(&[node(op, &["a", "b"], &["y"], &[])], &[ones("a", &[OVER, 1]), ones("b", &[1, OVER])], &["x"], &["y"]);
+            assert!(graph(&m).unwrap().run(&x).is_err(), "{op}");
+        }
+        // and an ordinary broadcast still runs
+        let m = model(&[node("Add", &["a", "b"], &["y"], &[])], &[ones("a", &[3, 1]), ones("b", &[1, 4])], &["x"], &["y"]);
+        assert_eq!(run1(&graph(&m).unwrap(), x), vec![2.0; 12]);
+    }
+
+    /// MatMul: the output [m, n] (and the broadcast operands) are checked before candle multiplies.
+    #[test]
+    fn a_matmul_output_over_the_limit_is_an_error() {
+        let x = Tensor::zeros((1, 1), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let m = model(&[node("MatMul", &["a", "b"], &["y"], &[])], &[ones("a", &[OVER, 1]), ones("b", &[1, OVER])], &["x"], &["y"]);
+        assert!(graph(&m).unwrap().run(&x).is_err());
+        // mismatched inner sizes are an error too
+        let m = model(&[node("MatMul", &["a", "b"], &["y"], &[])], &[ones("a", &[2, 3]), ones("b", &[4, 2])], &["x"], &["y"]);
+        assert!(graph(&m).unwrap().run(&x).is_err());
+        let m = model(&[node("MatMul", &["a", "b"], &["y"], &[])], &[ones("a", &[2, 3]), ones("b", &[3, 4])], &["x"], &["y"]);
+        assert_eq!(run1(&graph(&m).unwrap(), x), vec![3.0; 8]);
+    }
+
+    /// BatchNormalization: per-channel parameters that are not one value per channel would broadcast the output to the
+    /// parameters' size (a one-channel input with `K` parameters becomes `K` channels).
+    #[test]
+    fn batch_norm_parameters_must_match_the_channels() {
+        let bn = |k: i64| {
+            let names = ["s", "b", "m", "v"];
+            let inits: Vec<Vec<u8>> = names.iter().map(|n| ones(n, &[k])).collect();
+            model(&[node("BatchNormalization", &["x", "s", "b", "m", "v"], &["y"], &[])], &inits, &["x"], &["y"])
+        };
+        let x = Tensor::zeros((1, 1, 2, 2), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(graph(&bn(3)).unwrap().run(&x).is_err());
+        assert!(graph(&bn(OVER)).unwrap().run(&x).is_err());
+        assert_eq!(graph(&bn(1)).unwrap().run(&x).unwrap()[0].dims(), &[1, 1, 2, 2]);
+        // parameters of rank 2 whose quotient would broadcast
+        let m = model(
+            &[node("BatchNormalization", &["x", "s", "b", "m", "v"], &["y"], &[])],
+            &[ones("s", &[OVER, 1]), ones("b", &[1]), ones("m", &[1]), ones("v", &[1, OVER])],
+            &["x"],
+            &["y"],
+        );
+        assert!(graph(&m).unwrap().run(&x).is_err());
+    }
+
+    /// A convolution's output is `c_out` channels (from the weights) of the input's size: over the limit it is an error,
+    /// as is a bias that is not one value per output channel.
+    #[test]
+    fn a_convolution_output_over_the_limit_is_an_error() {
+        let x = Tensor::zeros((1, 1, 512, 512), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(graph(&conv(&[OVER, 1, 1, 1], &[])).unwrap().run(&x).is_err());
+        // a 3×3 one too: the same output, built through im2col
+        assert!(graph(&conv(&[OVER, 1, 3, 3], &[attr_str("auto_pad", "SAME_UPPER")])).unwrap().run(&x).is_err());
+        // one bias value on a one-channel output is fine, three are not
+        let with_bias = |k: i64| model(&[node("Conv", &["x", "w", "b"], &["y"], &[])], &[ones("w", &[1, 1, 1, 1]), ones("b", &[k])], &["x"], &["y"]);
+        let small = Tensor::zeros((1, 1, 2, 2), candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(graph(&with_bias(3)).unwrap().run(&small).is_err());
+        assert_eq!(graph(&with_bias(1)).unwrap().run(&small).unwrap()[0].dims(), &[1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn a_transposed_convolution_output_over_the_limit_is_an_error() {
+        let x = Tensor::zeros((1, 1, 512, 512), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let up = |w: &[i64]| model(&[node("ConvTranspose", &["x", "w"], &["y"], &[])], &[ones("w", w)], &["x"], &["y"]);
+        assert!(graph(&up(&[1, OVER, 1, 1])).unwrap().run(&x).is_err());
+        assert_eq!(graph(&up(&[1, 2, 2, 2])).unwrap().run(&x).unwrap()[0].dims(), &[1, 2, 513, 513]);
+    }
+
+    /// The scratch ceiling is higher than the output ceiling: the medium detector's Conv.121 on the 1600 × 1216 HierText
+    /// photo (1 × 400 × 304 × 256 × 3 × 3 = 280 million im2col elements) and on the
+    /// reader's largest photo (4000 × 4000: 2.304 billion) are accepted, and a buffer far above the ceiling is refused.
+    /// Checked on the bound itself: running such a convolution would allocate over a gigabyte.
+    #[test]
+    fn the_shipped_models_largest_scratch_buffers_are_within_the_scratch_limit() {
+        assert_eq!(checked_scratch(&[1, 400, 304, 256, 3, 3]).unwrap(), 280_166_400);
+        assert_eq!(checked_scratch(&[1, 1000, 1000, 256, 3, 3]).unwrap(), 2_304_000_000);
+        // the transposed convolution's column buffer of the same kind
+        assert!(checked_scratch(&[1, 64, 3, 3, 1000, 1000]).is_ok());
+        assert!(checked_scratch(&[1, 65_536, 65_536, 16, 3, 3]).is_err());
+        assert!(checked_scratch(&[usize::MAX, 2]).is_err());
+        // outputs keep the lower ceiling
+        assert!(checked_elements(&[1, 128, 2001, 2001]).is_ok());
+        assert!(checked_elements(&[1, 65_536, 65_536]).is_err());
+    }
+
+    /// A convolution whose im2col buffer is over the scratch ceiling while its output is small (many input channels and a
+    /// big kernel over a modest map) is an error, not an allocation of tens of gigabytes.
+    #[test]
+    fn a_convolution_scratch_buffer_over_the_limit_is_an_error() {
+        let x = Tensor::zeros((1, 64, 300, 300), candle_core::DType::F32, &Device::Cpu).unwrap();
+        // output 1 × 1 × 268 × 268, im2col 268 · 268 · 64 · 33 · 33 = 5.0 billion
+        assert!(graph(&conv(&[1, 64, 33, 33], &[])).unwrap().run(&x).is_err());
+    }
+
+    /// Concat: the output is the sum of its inputs, and the same value may be named any number of times.
+    #[test]
+    fn a_concat_over_the_limit_is_an_error() {
+        let n = 1usize << 25;
+        let x = Tensor::zeros((1, n), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let names = ["x"; 33];
+        let m = model(&[node("Concat", &names, &["y"], &[attr_int("axis", 1)])], &[], &["x"], &["y"]);
+        assert!(graph(&m).unwrap().run(&x).is_err());
+        // a shape vector doubled by Concat, node after node, is bounded too
+        let (a, b) = (Value::I(vec![0; 40_000]), Value::I(vec![0; 40_000]));
+        assert!(exec(&Op::Concat { axis: 0 }, &[Some(&a), Some(&b)]).is_err());
+        let small = Value::I(vec![1, 2]);
+        assert!(exec(&Op::Concat { axis: 0 }, &[Some(&small), Some(&small)]).is_ok());
+    }
+
+    /// Resize: the intermediate (rows picked, columns not yet) is checked as well as the result, and so is an output side
+    /// of an input with a zero dimension (no elements, so the product alone doesn't bound it).
+    #[test]
+    fn a_resize_intermediate_over_the_limit_is_an_error() {
+        let x = Tensor::zeros((1, 1, 1, 32768), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let x = Value::F(x);
+        let sizes = Value::I(vec![1, 1, OVER, 1]);
+        assert!(exec(&Op::Resize, &[Some(&x), None, None, Some(&sizes)]).is_err());
+        let empty = Value::F(Tensor::zeros((0, 1, 1, 1), candle_core::DType::F32, &Device::Cpu).unwrap());
+        let sizes = Value::I(vec![0, 1, 1 << 40, 1]);
+        assert!(exec(&Op::Resize, &[Some(&empty), None, None, Some(&sizes)]).is_err());
     }
 
     #[test]
