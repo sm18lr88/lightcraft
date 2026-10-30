@@ -100,6 +100,10 @@ fn byte_identical_files_form_an_exact_group_with_the_better_copy_to_keep() {
     assert_eq!(groups[0]["keep"], copy.0, "the rated copy is the one to keep");
     assert_eq!(groups[0]["reasons"], json!(["rated"]));
     assert!(groups[0]["photos"].as_array().unwrap().iter().all(|p| p["exact"] == true && p["similarity"] == 1.0));
+    // deciding an exact group checks it by content hash: no photo is decoded for a signature
+    s.execute("library.resolveDuplicates", &json!({"ids": [a.0, copy.0], "keep": [copy.0]})).unwrap();
+    assert_eq!(s.catalog.photo(a).unwrap().flag, Flag::Reject);
+    assert!(s.signatures.is_empty(), "an exact group is checked without reading signatures");
 }
 
 #[test]

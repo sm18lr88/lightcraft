@@ -376,6 +376,14 @@ fn along(sig: &[f32; 64], weights: &[f32; 64], norm: f32) -> f32 {
     sig.iter().zip(weights).map(|(v, w)| v * w).sum::<f32>() / norm
 }
 
+/// Whether `group` is one group of the same picture at the loosest cut-off.
+fn is_one_near_group(s: &mut Session, group: &[PhotoId]) -> Result<bool> {
+    let ids: Vec<u64> = group.iter().map(|id| id.0).collect();
+    let found = find(s, &json!({"level": "near", "ids": ids, "similarity": NEAR_FLOOR}))?;
+    let groups = found["groups"].as_array().map_or(&[][..], Vec::as_slice);
+    Ok(groups.len() == 1 && groups.first().and_then(|g| g["photos"].as_array()).is_some_and(|p| p.len() == group.len()))
+}
+
 /// Mark every photo of a group Rejected except the ones kept. One undo step; nothing is deleted.
 fn resolve(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "library.resolveDuplicates";
@@ -407,12 +415,13 @@ fn resolve(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, format!("photo {} is not in `ids`", x.0)));
     }
     // a caller other than the dialog can name any photos: they must be one group. A group found at a stricter cut-off is
-    // still one group of its own photos at the loosest one, so the dialog's groups always pass.
-    let ids: Vec<u64> = group.iter().map(|id| id.0).collect();
-    let found = find(s, &json!({"level": "near", "ids": ids, "similarity": NEAR_FLOOR}))?;
-    let groups = found["groups"].as_array().map_or(&[][..], Vec::as_slice);
-    let whole = groups.len() == 1 && groups.first().and_then(|g| g["photos"].as_array()).is_some_and(|p| p.len() == group.len());
-    if !whole {
+    // still one group of its own photos at the loosest one, so the dialog's groups always pass. Byte-identical photos
+    // pass on their content hash alone; a near group's signatures were read by the scan that found it (cached by
+    // content), so this decodes nothing and compares only the group's own photos.
+    let mut keys = group.iter().map(|id| s.catalog.photo(*id).and_then(|q| exact_key(q)));
+    let first = keys.next().flatten();
+    let one_file = first.is_some() && keys.all(|k| k == first);
+    if !one_file && !is_one_near_group(s, &group)? {
         return Err(bad(C, "these photos are not one group of duplicates: use a group from library.findDuplicates"));
     }
     let mut ops = Vec::new();
