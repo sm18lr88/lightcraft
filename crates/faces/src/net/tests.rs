@@ -354,15 +354,66 @@ fn a_device_that_failed_on_the_first_input_is_not_asked_for_the_rest_of_the_batc
 }
 
 #[test]
-fn a_failing_device_detaches_the_net_once() {
+fn a_failing_device_is_taken_off_the_net_without_counting_as_a_cpu_choice() {
     let (g, x) = two_convs();
     let net = Net::new(g).unwrap();
     let device = Counting::new(false);
     net.attach_checked(device.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
-    assert_eq!(net.detaches.load(std::sync::atomic::Ordering::SeqCst), 0);
     device.fail_from_now();
     net.run_batch(two_convs_inputs(2)).unwrap();
-    assert_eq!(net.detaches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(net.accelerator().is_none(), "the failed device stays published");
+    assert_eq!(net.detaches.load(std::sync::atomic::Ordering::SeqCst), 0, "a device failure is not the user choosing the CPU");
+}
+
+fn good_fake() -> Arc<Fake> {
+    Arc::new(Fake { skew: 0.0, fail_after: usize::MAX.into() })
+}
+
+/// A scan keeps the device it started with. When that device fails after a re-check has published another one, only
+/// the scan's own device goes: the new one stays.
+#[test]
+fn an_old_scans_failing_device_leaves_a_newer_device_published() {
+    let (g, x) = two_convs();
+    let net = Net::new(g).unwrap();
+    net.attach_checked(good_fake(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    let old_scan = Lane::new(net.accelerator(), true);
+    let newer: Arc<dyn Accelerator> = good_fake();
+    net.attach_checked(newer.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    old_scan.fail(&net);
+    assert!(net.accelerator().is_some_and(|now| Arc::ptr_eq(&now, &newer)), "the old scan's failure dropped the newer device");
+}
+
+/// The same scan failing while the re-check runs does not refuse the device being checked, as the user choosing the
+/// CPU would.
+#[test]
+fn an_old_scans_failing_device_during_a_check_does_not_refuse_the_checked_device() {
+    let (g, x) = two_convs();
+    let net = Arc::new(Net::new(g).unwrap());
+    net.attach_checked(good_fake(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    let old_scan = Arc::new(Lane::new(net.accelerator(), true));
+    // a device that agrees everywhere; at its first convolution the old scan's device fails
+    struct FailsOldScanFirst {
+        inner: Fake,
+        old: std::sync::Mutex<Option<(Arc<Net>, Arc<Lane>)>>,
+    }
+    impl Accelerator for FailsOldScanFirst {
+        fn device(&self) -> String {
+            "fails-old-scan".into()
+        }
+        fn conv(&self, j: &ConvJob) -> std::result::Result<Option<Vec<f32>>, String> {
+            if let Some((net, lane)) = self.old.lock().unwrap().take() {
+                lane.fail(&net);
+            }
+            self.inner.conv(j)
+        }
+    }
+    let checked: Arc<dyn Accelerator> = Arc::new(FailsOldScanFirst {
+        inner: Fake { skew: 0.0, fail_after: usize::MAX.into() },
+        old: std::sync::Mutex::new(Some((net.clone(), old_scan.clone()))),
+    });
+    net.attach_checked(checked.clone(), std::slice::from_ref(&x), 1e-4, false).unwrap();
+    assert!(old_scan.has_failed());
+    assert!(net.accelerator().is_some_and(|now| Arc::ptr_eq(&now, &checked)), "the checked device was refused");
 }
 
 #[test]

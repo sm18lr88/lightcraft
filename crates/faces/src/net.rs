@@ -151,12 +151,13 @@ impl Lane {
         self.device.as_ref().filter(|_| !self.has_failed())
     }
 
-    /// The device failed: stop using it, and drop it from the net when it is the net's (once, however many calls
-    /// report the failure).
+    /// The device failed: stop using it, and take it off the net while the net still uses this very device (once,
+    /// however many calls report the failure). A failure is not the user choosing the CPU, so a check that is running
+    /// meanwhile, or a device published since this lane started, is left alone.
     fn fail(&self, net: &Net) {
         let first = !self.failed.swap(true, Ordering::SeqCst);
-        if first && self.published {
-            net.detach();
+        if let (true, true, Some(device)) = (first, self.published, &self.device) {
+            net.drop_failed(device);
         }
     }
 
@@ -269,6 +270,14 @@ impl Net {
         let mut slot = self.accelerator.write().unwrap_or_else(PoisonError::into_inner);
         self.detaches.fetch_add(1, Ordering::SeqCst);
         *slot = None;
+    }
+
+    /// Take `device` off the net after it failed, unless another device has been published since.
+    fn drop_failed(&self, device: &Arc<dyn Accelerator>) {
+        let mut slot = self.accelerator.write().unwrap_or_else(PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|now| Arc::ptr_eq(now, device)) {
+            *slot = None;
+        }
     }
 
     /// Drop the published accelerator without refusing a check that is running.
