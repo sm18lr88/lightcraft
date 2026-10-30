@@ -406,6 +406,15 @@ fn resolve(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(x) = keep.iter().find(|k| !group.contains(k)) {
         return Err(bad(C, format!("photo {} is not in `ids`", x.0)));
     }
+    // a caller other than the dialog can name any photos: they must be one group. A group found at a stricter cut-off is
+    // still one group of its own photos at the loosest one, so the dialog's groups always pass.
+    let ids: Vec<u64> = group.iter().map(|id| id.0).collect();
+    let found = find(s, &json!({"level": "near", "ids": ids, "similarity": NEAR_FLOOR}))?;
+    let groups = found["groups"].as_array().map_or(&[][..], Vec::as_slice);
+    let whole = groups.len() == 1 && groups.first().and_then(|g| g["photos"].as_array()).is_some_and(|p| p.len() == group.len());
+    if !whole {
+        return Err(bad(C, "these photos are not one group of duplicates: use a group from library.findDuplicates"));
+    }
     let mut ops = Vec::new();
     let (mut rejected, mut kept) = (Vec::new(), Vec::new());
     for id in &group {

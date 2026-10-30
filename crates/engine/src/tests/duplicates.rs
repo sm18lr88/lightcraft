@@ -164,7 +164,7 @@ fn keeping_one_rejects_the_others_in_one_undo_step_and_deletes_nothing() {
 #[test]
 fn malformed_input_is_an_error_not_a_panic() {
     let mut s = library("errors");
-    let (a, jpg) = (id_of(&s, "a.png"), id_of(&s, "a-resaved.jpg"));
+    let (a, jpg, b) = (id_of(&s, "a.png"), id_of(&s, "a-resaved.jpg"), id_of(&s, "b.png"));
     let before: Vec<Flag> = s.catalog.photos().map(|p| p.flag).collect();
     for params in [
         json!({"level": "similar"}),
@@ -191,6 +191,9 @@ fn malformed_input_is_an_error_not_a_panic() {
         json!({"ids": [a.0], "keep": [a.0]}),
         json!({"ids": 7, "keep": [a.0]}),
         json!({"ids": [a.0, jpg.0], "keep": [a.0], "delete": true}),
+        // a different picture is not a duplicate, whoever names it
+        json!({"ids": [a.0, b.0], "keep": [a.0]}),
+        json!({"ids": [a.0, jpg.0, b.0], "keep": [a.0]}),
     ] {
         assert!(s.execute("library.resolveDuplicates", &params).is_err(), "{params}");
     }
